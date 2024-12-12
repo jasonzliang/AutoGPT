@@ -37,7 +37,7 @@ Since components are regular classes you can pass data (including other componen
 For example we can pass a config object and then retrieve an API key from it when needed:
 
 ```py
-class ConfigurableComponent(MessageProvider):
+class DataComponent(MessageProvider):
     def __init__(self, config: Config):
         self.config = config
 
@@ -50,6 +50,35 @@ class ConfigurableComponent(MessageProvider):
 
 !!! note
     Component-specific configuration handling isn't implemented yet.
+
+## Configuring components
+
+Components can be configured using a pydantic model.
+To make component configurable, it must inherit from `ConfigurableComponent[BM]` where `BM` is the configuration class inheriting from pydantic's `BaseModel`.
+You should pass the configuration instance to the `ConfigurableComponent`'s `__init__` or set its `config` property directly.
+Using configuration allows you to load confugration from a file, and also serialize and deserialize it easily for any agent.
+To learn more about configuration, including storing sensitive information and serialization see [Component Configuration](./components.md#component-configuration).
+
+```py
+# Example component configuration
+class UserGreeterConfiguration(BaseModel):
+    user_name: str
+
+class UserGreeterComponent(MessageProvider, ConfigurableComponent[UserGreeterConfiguration]):
+    def __init__(self):
+        # Creating configuration instance
+        # You could also pass it to the component constructor
+        # e.g. `def __init__(self, config: UserGreeterConfiguration):`
+        config = UserGreeterConfiguration(user_name="World")
+        # Passing the configuration instance to the parent class
+        UserGreeterComponent.__init__(self, config)
+        # This has the same effect as the line above:
+        # self.config = UserGreeterConfiguration(user_name="World")
+
+    def get_messages(self) -> Iterator[ChatMessage]:
+        # You can use the configuration like a regular model
+        yield ChatMessage.system(f"Hello, {self.config.user_name}!")
+```
 
 ## Providing commands
 
@@ -95,7 +124,7 @@ After components provided all necessary data, the agent needs to build the final
 Currently, `PromptStrategy` (*not* a protocol) is responsible for building the final prompt.
 
 If you want to change the way the prompt is built, you need to create a new `PromptStrategy` class, and then call relevant methods in your agent class.
-You can have a look at the default strategy used by the AutoGPT Agent: [OneShotAgentPromptStrategy](https://github.com/Significant-Gravitas/AutoGPT/tree/master/autogpt/autogpt/agents/prompt_strategies/one_shot.py), and how it's used in the [Agent](https://github.com/Significant-Gravitas/AutoGPT/tree/master/autogpt/autogpt/agents/agent.py) (search for `self.prompt_strategy`).
+You can have a look at the default strategy used by the AutoGPT Agent: [OneShotAgentPromptStrategy](https://github.com/Significant-Gravitas/AutoGPT/tree/master/classic/original_autogpt/agents/prompt_strategies/one_shot.py), and how it's used in the [Agent](https://github.com/Significant-Gravitas/AutoGPT/tree/master/classic/original_autogpt/agents/agent.py) (search for `self.prompt_strategy`).
 
 ## Example `UserInteractionComponent`
 
@@ -234,7 +263,7 @@ class MyAgent(Agent):
 
 ## Learn more
 
-The best place to see more examples is to look at the built-in components in the [autogpt/components](https://github.com/Significant-Gravitas/AutoGPT/tree/master/autogpt/autogpt/components/) and [autogpt/commands](https://github.com/Significant-Gravitas/AutoGPT/tree/master/autogpt/autogpt/commands/) directories.
+The best place to see more examples is to look at the built-in components in the [classic/original_autogpt/components](https://github.com/Significant-Gravitas/AutoGPT/tree/master/classic/original_autogpt/components/) and [classic/original_autogpt/commands](https://github.com/Significant-Gravitas/AutoGPT/tree/master/classic/original_autogpt/commands/) directories.
 
 Guide on how to extend the built-in agent and build your own: [🤖 Agents](./agents.md)  
 Order of some components matters, see [🧩 Components](./components.md) to learn more about components and how they can be customized.  

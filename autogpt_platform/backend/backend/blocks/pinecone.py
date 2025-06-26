@@ -10,22 +10,18 @@ from backend.data.model import (
     CredentialsMetaInput,
     SchemaField,
 )
+from backend.integrations.providers import ProviderName
 
 PineconeCredentials = APIKeyCredentials
 PineconeCredentialsInput = CredentialsMetaInput[
-    Literal["pinecone"],
+    Literal[ProviderName.PINECONE],
     Literal["api_key"],
 ]
 
 
 def PineconeCredentialsField() -> PineconeCredentialsInput:
-    """
-    Creates a Pinecone credentials input on a block.
-
-    """
+    """Creates a Pinecone credentials input on a block."""
     return CredentialsField(
-        provider="pinecone",
-        supported_credential_types={"api_key"},
         description="The Pinecone integration can be used with an API Key.",
     )
 
@@ -60,7 +56,7 @@ class PineconeInitBlock(Block):
             output_schema=PineconeInitBlock.Output,
         )
 
-    def run(
+    async def run(
         self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
     ) -> BlockOutput:
         pc = Pinecone(api_key=credentials.api_key.get_secret_value())
@@ -121,7 +117,7 @@ class PineconeQueryBlock(Block):
             output_schema=PineconeQueryBlock.Output,
         )
 
-    def run(
+    async def run(
         self,
         input_data: Input,
         *,
@@ -147,7 +143,7 @@ class PineconeQueryBlock(Block):
                 top_k=input_data.top_k,
                 include_values=input_data.include_values,
                 include_metadata=input_data.include_metadata,
-            ).to_dict()
+            ).to_dict()  # type: ignore
             combined_text = ""
             if results["matches"]:
                 texts = [
@@ -181,7 +177,8 @@ class PineconeInsertBlock(Block):
             description="Namespace to use in Pinecone", default=""
         )
         metadata: dict = SchemaField(
-            description="Additional metadata to store with each vector", default={}
+            description="Additional metadata to store with each vector",
+            default_factory=dict,
         )
 
     class Output(BlockSchema):
@@ -198,7 +195,7 @@ class PineconeInsertBlock(Block):
             output_schema=PineconeInsertBlock.Output,
         )
 
-    def run(
+    async def run(
         self,
         input_data: Input,
         *,

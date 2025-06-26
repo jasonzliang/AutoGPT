@@ -1,19 +1,26 @@
+import json
 from typing import Any
 from uuid import UUID
 
+import autogpt_libs.auth.models
+import fastapi.exceptions
 import pytest
+from pytest_snapshot.plugin import Snapshot
 
-from backend.blocks.basic import AgentInputBlock, AgentOutputBlock, StoreValueBlock
+import backend.server.v2.store.model as store
+from backend.blocks.basic import StoreValueBlock
+from backend.blocks.io import AgentInputBlock, AgentOutputBlock
 from backend.data.block import BlockSchema
 from backend.data.graph import Graph, Link, Node
 from backend.data.model import SchemaField
 from backend.data.user import DEFAULT_USER_ID
 from backend.server.model import CreateGraph
+from backend.usecases.sample import create_test_user
 from backend.util.test import SpinTestServer
 
 
-@pytest.mark.asyncio(scope="session")
-async def test_graph_creation(server: SpinTestServer):
+@pytest.mark.asyncio(loop_scope="session")
+async def test_graph_creation(server: SpinTestServer, snapshot: Snapshot):
     """
     Test the creation of a graph with nodes and links.
 
@@ -65,9 +72,27 @@ async def test_graph_creation(server: SpinTestServer):
     assert links[0].source_id in {nodes[0].id, nodes[1].id, nodes[2].id}
     assert links[0].sink_id in {nodes[0].id, nodes[1].id, nodes[2].id}
 
+    # Create a serializable version of the graph for snapshot testing
+    # Remove dynamic IDs to make snapshots reproducible
+    graph_data = {
+        "name": created_graph.name,
+        "description": created_graph.description,
+        "nodes_count": len(created_graph.nodes),
+        "links_count": len(created_graph.links),
+        "node_blocks": [node.block_id for node in created_graph.nodes],
+        "link_structure": [
+            {"source_name": link.source_name, "sink_name": link.sink_name}
+            for link in created_graph.links
+        ],
+    }
+    snapshot.snapshot_dir = "snapshots"
+    snapshot.assert_match(
+        json.dumps(graph_data, indent=2, sort_keys=True), "grph_struct"
+    )
 
-@pytest.mark.asyncio(scope="session")
-async def test_get_input_schema(server: SpinTestServer):
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_get_input_schema(server: SpinTestServer, snapshot: Snapshot):
     """
     Test the get_input_schema method of a created graph.
 
@@ -90,7 +115,12 @@ async def test_get_input_schema(server: SpinTestServer):
             Node(
                 id="node_0_a",
                 block_id=input_block,
-                input_default={"name": "in_key_a", "title": "Key A", "value": "A"},
+                input_default={
+                    "name": "in_key_a",
+                    "title": "Key A",
+                    "value": "A",
+                    "advanced": True,
+                },
                 metadata={"id": "node_0_a"},
             ),
             Node(
@@ -138,8 +168,8 @@ async def test_get_input_schema(server: SpinTestServer):
     )
 
     class ExpectedInputSchema(BlockSchema):
-        in_key_a: Any = SchemaField(title="Key A", default="A", advanced=False)
-        in_key_b: Any = SchemaField(title="in_key_b", advanced=True)
+        in_key_a: Any = SchemaField(title="Key A", default="A", advanced=True)
+        in_key_b: Any = SchemaField(title="in_key_b", advanced=False)
 
     class ExpectedOutputSchema(BlockSchema):
         out_key: Any = SchemaField(
@@ -152,6 +182,151 @@ async def test_get_input_schema(server: SpinTestServer):
     input_schema["title"] = "ExpectedInputSchema"
     assert input_schema == ExpectedInputSchema.jsonschema()
 
+    # Add snapshot testing for the schemas
+    snapshot.snapshot_dir = "snapshots"
+    snapshot.assert_match(
+        json.dumps(input_schema, indent=2, sort_keys=True), "grph_in_schm"
+    )
+
     output_schema = created_graph.output_schema
     output_schema["title"] = "ExpectedOutputSchema"
     assert output_schema == ExpectedOutputSchema.jsonschema()
+
+    # Add snapshot testing for the output schema
+    snapshot.snapshot_dir = "snapshots"
+    snapshot.assert_match(
+        json.dumps(output_schema, indent=2, sort_keys=True), "grph_out_schm"
+    )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_clean_graph(server: SpinTestServer):
+    """
+    Test the clean_graph function that:
+    1. Clears input block values
+    2. Removes credentials from nodes
+    """
+    # Create a graph with input blocks and credentials
+    graph = Graph(
+        id="test_clean_graph",
+        name="Test Clean Graph",
+        description="Test graph cleaning",
+        nodes=[
+            Node(
+                id="input_node",
+                block_id=AgentInputBlock().id,
+                input_default={
+                    "name": "test_input",
+                    "value": "test value",
+                    "description": "Test input description",
+                },
+            ),
+        ],
+        links=[],
+    )
+
+    # Create graph and get model
+    create_graph = CreateGraph(graph=graph)
+    created_graph = await server.agent_server.test_create_graph(
+        create_graph, DEFAULT_USER_ID
+    )
+
+    # Clean the graph
+    created_graph = await server.agent_server.test_get_graph(
+        created_graph.id, created_graph.version, DEFAULT_USER_ID, for_export=True
+    )
+
+    # # Verify input block value is cleared
+    input_node = next(
+        n for n in created_graph.nodes if n.block_id == AgentInputBlock().id
+    )
+    assert input_node.input_default["value"] == ""
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_access_store_listing_graph(server: SpinTestServer):
+    """
+    Test the access of a store listing graph.
+    """
+    graph = Graph(
+        id="test_clean_graph",
+        name="Test Clean Graph",
+        description="Test graph cleaning",
+        nodes=[
+            Node(
+                id="input_node",
+                block_id=AgentInputBlock().id,
+                input_default={
+                    "name": "test_input",
+                    "value": "test value",
+                    "description": "Test input description",
+                },
+            ),
+        ],
+        links=[],
+    )
+
+    # Create graph and get model
+    create_graph = CreateGraph(graph=graph)
+    created_graph = await server.agent_server.test_create_graph(
+        create_graph, DEFAULT_USER_ID
+    )
+
+    store_submission_request = store.StoreSubmissionRequest(
+        agent_id=created_graph.id,
+        agent_version=created_graph.version,
+        slug=created_graph.id,
+        name="Test name",
+        sub_heading="Test sub heading",
+        video_url=None,
+        image_urls=[],
+        description="Test description",
+        categories=[],
+    )
+
+    # First we check the graph an not be accessed by a different user
+    with pytest.raises(fastapi.exceptions.HTTPException) as exc_info:
+        await server.agent_server.test_get_graph(
+            created_graph.id,
+            created_graph.version,
+            "3e53486c-cf57-477e-ba2a-cb02dc828e1b",
+        )
+    assert exc_info.value.status_code == 404
+    assert "Graph" in str(exc_info.value.detail)
+
+    # Now we create a store listing
+    store_listing = await server.agent_server.test_create_store_listing(
+        store_submission_request, DEFAULT_USER_ID
+    )
+
+    if isinstance(store_listing, fastapi.responses.JSONResponse):
+        assert False, "Failed to create store listing"
+
+    slv_id = (
+        store_listing.store_listing_version_id
+        if store_listing.store_listing_version_id is not None
+        else None
+    )
+
+    assert slv_id is not None
+
+    admin_user = await create_test_user(alt_user=True)
+    await server.agent_server.test_review_store_listing(
+        store.ReviewSubmissionRequest(
+            store_listing_version_id=slv_id,
+            is_approved=True,
+            comments="Test comments",
+        ),
+        autogpt_libs.auth.models.User(
+            user_id=admin_user.id,
+            role="admin",
+            email=admin_user.email,
+            phone_number="1234567890",
+        ),
+    )
+
+    # Now we check the graph can be accessed by a user that does not own the graph
+    got_graph = await server.agent_server.test_get_graph(
+        created_graph.id, created_graph.version, "3e53486c-cf57-477e-ba2a-cb02dc828e1b"
+    )
+    assert got_graph is not None

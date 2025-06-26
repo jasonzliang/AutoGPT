@@ -34,7 +34,7 @@ class ReadCsvBlock(Block):
         )
         skip_columns: list[str] = SchemaField(
             description="The columns to skip from the start of the row",
-            default=[],
+            default_factory=list,
         )
 
     class Output(BlockSchema):
@@ -69,7 +69,7 @@ class ReadCsvBlock(Block):
             ],
         )
 
-    def run(self, input_data: Input, **kwargs) -> BlockOutput:
+    async def run(self, input_data: Input, **kwargs) -> BlockOutput:
         import csv
         from io import StringIO
 

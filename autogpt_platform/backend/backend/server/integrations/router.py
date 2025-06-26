@@ -1,30 +1,39 @@
+import asyncio
 import logging
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Awaitable, Literal
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request
-from pydantic import BaseModel, Field, SecretStr
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    status,
+)
+from pydantic import BaseModel, Field
 
-from backend.data.graph import set_node_webhook
+from backend.data.graph import get_graph, set_node_webhook
 from backend.data.integrations import (
     WebhookEvent,
-    get_all_webhooks,
+    get_all_webhooks_by_creds,
     get_webhook,
-    listen_for_webhook_event,
     publish_webhook_event,
+    wait_for_webhook_event,
 )
-from backend.data.model import (
-    APIKeyCredentials,
-    Credentials,
-    CredentialsType,
-    OAuth2Credentials,
-)
-from backend.executor.manager import ExecutionManager
+from backend.data.model import Credentials, CredentialsType, OAuth2Credentials
+from backend.executor.utils import add_graph_execution
 from backend.integrations.creds_manager import IntegrationCredentialsManager
-from backend.integrations.oauth import HANDLERS_BY_NAME, BaseOAuthHandler
-from backend.integrations.webhooks import WEBHOOK_MANAGERS_BY_NAME
-from backend.util.exceptions import NeedConfirmation
-from backend.util.service import get_service_client
+from backend.integrations.oauth import HANDLERS_BY_NAME
+from backend.integrations.providers import ProviderName
+from backend.integrations.webhooks import get_webhook_manager
+from backend.server.v2.library.db import set_preset_webhook, update_preset
+from backend.util.exceptions import NeedConfirmation, NotFoundError
 from backend.util.settings import Settings
+
+if TYPE_CHECKING:
+    from backend.integrations.oauth import BaseOAuthHandler
 
 from ..utils import get_user_id
 
@@ -41,8 +50,10 @@ class LoginResponse(BaseModel):
 
 
 @router.get("/{provider}/login")
-def login(
-    provider: Annotated[str, Path(title="The provider to initiate an OAuth flow for")],
+async def login(
+    provider: Annotated[
+        ProviderName, Path(title="The provider to initiate an OAuth flow for")
+    ],
     user_id: Annotated[str, Depends(get_user_id)],
     request: Request,
     scopes: Annotated[
@@ -54,11 +65,12 @@ def login(
     requested_scopes = scopes.split(",") if scopes else []
 
     # Generate and store a secure random state token along with the scopes
-    state_token = creds_manager.store.store_state_token(
+    state_token, code_challenge = await creds_manager.store.store_state_token(
         user_id, provider, requested_scopes
     )
-
-    login_url = handler.get_login_url(requested_scopes, state_token)
+    login_url = handler.get_login_url(
+        requested_scopes, state_token, code_challenge=code_challenge
+    )
 
     return LoginResponse(login_url=login_url, state_token=state_token)
 
@@ -73,8 +85,10 @@ class CredentialsMetaResponse(BaseModel):
 
 
 @router.post("/{provider}/callback")
-def callback(
-    provider: Annotated[str, Path(title="The target provider for this OAuth exchange")],
+async def callback(
+    provider: Annotated[
+        ProviderName, Path(title="The target provider for this OAuth exchange")
+    ],
     code: Annotated[str, Body(title="Authorization code acquired by user login")],
     state_token: Annotated[str, Body(title="Anti-CSRF nonce")],
     user_id: Annotated[str, Depends(get_user_id)],
@@ -84,39 +98,56 @@ def callback(
     handler = _get_provider_oauth_handler(request, provider)
 
     # Verify the state token
-    if not creds_manager.store.verify_state_token(user_id, state_token, provider):
-        logger.warning(f"Invalid or expired state token for user {user_id}")
-        raise HTTPException(status_code=400, detail="Invalid or expired state token")
+    valid_state = await creds_manager.store.verify_state_token(
+        user_id, state_token, provider
+    )
 
-    try:
-        scopes = creds_manager.store.get_any_valid_scopes_from_state_token(
-            user_id, state_token, provider
+    if not valid_state:
+        logger.warning(f"Invalid or expired state token for user {user_id}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired state token",
         )
+    try:
+        scopes = valid_state.scopes
         logger.debug(f"Retrieved scopes from state token: {scopes}")
 
         scopes = handler.handle_default_scopes(scopes)
 
-        credentials = handler.exchange_code_for_tokens(code, scopes)
+        credentials = await handler.exchange_code_for_tokens(
+            code, scopes, valid_state.code_verifier
+        )
+
         logger.debug(f"Received credentials with final scopes: {credentials.scopes}")
+
+        # Linear returns scopes as a single string with spaces, so we need to split them
+        # TODO: make a bypass of this part of the OAuth handler
+        if len(credentials.scopes) == 1 and " " in credentials.scopes[0]:
+            credentials.scopes = credentials.scopes[0].split(" ")
 
         # Check if the granted scopes are sufficient for the requested scopes
         if not set(scopes).issubset(set(credentials.scopes)):
             # For now, we'll just log the warning and continue
             logger.warning(
-                f"Granted scopes {credentials.scopes} for {provider}do not include all requested scopes {scopes}"
+                f"Granted scopes {credentials.scopes} for provider {provider.value} "
+                f"do not include all requested scopes {scopes}"
             )
 
     except Exception as e:
-        logger.error(f"Code->Token exchange failed for provider {provider}: {e}")
+        logger.error(
+            f"OAuth2 Code->Token exchange failed for provider {provider.value}: {e}"
+        )
         raise HTTPException(
-            status_code=400, detail=f"Failed to exchange code for tokens: {str(e)}"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"OAuth2 callback failed to exchange code for tokens: {str(e)}",
         )
 
     # TODO: Allow specifying `title` to set on `credentials`
-    creds_manager.create(user_id, credentials)
+    await creds_manager.create(user_id, credentials)
 
     logger.debug(
-        f"Successfully processed OAuth callback for user {user_id} and provider {provider}"
+        f"Successfully processed OAuth callback for user {user_id} "
+        f"and provider {provider.value}"
     )
     return CredentialsMetaResponse(
         id=credentials.id,
@@ -129,10 +160,10 @@ def callback(
 
 
 @router.get("/credentials")
-def list_credentials(
+async def list_credentials(
     user_id: Annotated[str, Depends(get_user_id)],
 ) -> list[CredentialsMetaResponse]:
-    credentials = creds_manager.store.get_all_creds(user_id)
+    credentials = await creds_manager.store.get_all_creds(user_id)
     return [
         CredentialsMetaResponse(
             id=cred.id,
@@ -147,11 +178,13 @@ def list_credentials(
 
 
 @router.get("/{provider}/credentials")
-def list_credentials_by_provider(
-    provider: Annotated[str, Path(title="The provider to list credentials for")],
+async def list_credentials_by_provider(
+    provider: Annotated[
+        ProviderName, Path(title="The provider to list credentials for")
+    ],
     user_id: Annotated[str, Depends(get_user_id)],
 ) -> list[CredentialsMetaResponse]:
-    credentials = creds_manager.store.get_creds_by_provider(user_id, provider)
+    credentials = await creds_manager.store.get_creds_by_provider(user_id, provider)
     return [
         CredentialsMetaResponse(
             id=cred.id,
@@ -166,45 +199,43 @@ def list_credentials_by_provider(
 
 
 @router.get("/{provider}/credentials/{cred_id}")
-def get_credential(
-    provider: Annotated[str, Path(title="The provider to retrieve credentials for")],
+async def get_credential(
+    provider: Annotated[
+        ProviderName, Path(title="The provider to retrieve credentials for")
+    ],
     cred_id: Annotated[str, Path(title="The ID of the credentials to retrieve")],
     user_id: Annotated[str, Depends(get_user_id)],
 ) -> Credentials:
-    credential = creds_manager.get(user_id, cred_id)
+    credential = await creds_manager.get(user_id, cred_id)
     if not credential:
-        raise HTTPException(status_code=404, detail="Credentials not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Credentials not found"
+        )
     if credential.provider != provider:
         raise HTTPException(
-            status_code=404, detail="Credentials do not match the specified provider"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Credentials do not match the specified provider",
         )
     return credential
 
 
 @router.post("/{provider}/credentials", status_code=201)
-def create_api_key_credentials(
+async def create_credentials(
     user_id: Annotated[str, Depends(get_user_id)],
-    provider: Annotated[str, Path(title="The provider to create credentials for")],
-    api_key: Annotated[str, Body(title="The API key to store")],
-    title: Annotated[str, Body(title="Optional title for the credentials")],
-    expires_at: Annotated[
-        int | None, Body(title="Unix timestamp when the key expires")
-    ] = None,
-) -> APIKeyCredentials:
-    new_credentials = APIKeyCredentials(
-        provider=provider,
-        api_key=SecretStr(api_key),
-        title=title,
-        expires_at=expires_at,
-    )
-
+    provider: Annotated[
+        ProviderName, Path(title="The provider to create credentials for")
+    ],
+    credentials: Credentials,
+) -> Credentials:
+    credentials.provider = provider
     try:
-        creds_manager.create(user_id, new_credentials)
+        await creds_manager.create(user_id, credentials)
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"Failed to store credentials: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to store credentials: {str(e)}",
         )
-    return new_credentials
+    return credentials
 
 
 class CredentialsDeletionResponse(BaseModel):
@@ -225,32 +256,37 @@ class CredentialsDeletionNeedsConfirmationResponse(BaseModel):
 @router.delete("/{provider}/credentials/{cred_id}")
 async def delete_credentials(
     request: Request,
-    provider: Annotated[str, Path(title="The provider to delete credentials for")],
+    provider: Annotated[
+        ProviderName, Path(title="The provider to delete credentials for")
+    ],
     cred_id: Annotated[str, Path(title="The ID of the credentials to delete")],
     user_id: Annotated[str, Depends(get_user_id)],
     force: Annotated[
         bool, Query(title="Whether to proceed if any linked webhooks are still in use")
     ] = False,
 ) -> CredentialsDeletionResponse | CredentialsDeletionNeedsConfirmationResponse:
-    creds = creds_manager.store.get_creds_by_id(user_id, cred_id)
+    creds = await creds_manager.store.get_creds_by_id(user_id, cred_id)
     if not creds:
-        raise HTTPException(status_code=404, detail="Credentials not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Credentials not found"
+        )
     if creds.provider != provider:
         raise HTTPException(
-            status_code=404, detail="Credentials do not match the specified provider"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Credentials do not match the specified provider",
         )
 
     try:
-        await remove_all_webhooks_for_credentials(creds, force)
+        await remove_all_webhooks_for_credentials(user_id, creds, force)
     except NeedConfirmation as e:
         return CredentialsDeletionNeedsConfirmationResponse(message=str(e))
 
-    creds_manager.delete(user_id, cred_id)
+    await creds_manager.delete(user_id, cred_id)
 
     tokens_revoked = None
     if isinstance(creds, OAuth2Credentials):
         handler = _get_provider_oauth_handler(request, provider)
-        tokens_revoked = handler.revoke_tokens(creds)
+        tokens_revoked = await handler.revoke_tokens(creds)
 
     return CredentialsDeletionResponse(revoked=tokens_revoked)
 
@@ -264,15 +300,24 @@ async def delete_credentials(
 @router.post("/{provider}/webhooks/{webhook_id}/ingress")
 async def webhook_ingress_generic(
     request: Request,
-    provider: Annotated[str, Path(title="Provider where the webhook was registered")],
+    provider: Annotated[
+        ProviderName, Path(title="Provider where the webhook was registered")
+    ],
     webhook_id: Annotated[str, Path(title="Our ID for the webhook")],
 ):
-    logger.debug(f"Received {provider} webhook ingress for ID {webhook_id}")
-    webhook_manager = WEBHOOK_MANAGERS_BY_NAME[provider]()
-    webhook = await get_webhook(webhook_id)
+    logger.debug(f"Received {provider.value} webhook ingress for ID {webhook_id}")
+    webhook_manager = get_webhook_manager(provider)
+    try:
+        webhook = await get_webhook(webhook_id, include_relations=True)
+    except NotFoundError as e:
+        logger.warning(f"Webhook payload received for unknown webhook #{webhook_id}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     logger.debug(f"Webhook #{webhook_id}: {webhook}")
     payload, event_type = await webhook_manager.validate_payload(webhook, request)
-    logger.debug(f"Validated {provider} {event_type} event with payload {payload}")
+    logger.debug(
+        f"Validated {provider.value} {webhook.webhook_type} {event_type} event "
+        f"with payload {payload}"
+    )
 
     webhook_event = WebhookEvent(
         provider=provider,
@@ -283,84 +328,155 @@ async def webhook_ingress_generic(
     await publish_webhook_event(webhook_event)
     logger.debug(f"Webhook event published: {webhook_event}")
 
-    if not webhook.attached_nodes:
+    if not (webhook.triggered_nodes or webhook.triggered_presets):
         return
 
-    executor = get_service_client(ExecutionManager)
-    for node in webhook.attached_nodes:
+    executions: list[Awaitable] = []
+    for node in webhook.triggered_nodes:
         logger.debug(f"Webhook-attached node: {node}")
         if not node.is_triggered_by_event_type(event_type):
             logger.debug(f"Node #{node.id} doesn't trigger on event {event_type}")
             continue
         logger.debug(f"Executing graph #{node.graph_id} node #{node.id}")
-        executor.add_execution(
-            node.graph_id,
-            data={f"webhook_{webhook_id}_payload": payload},
-            user_id=webhook.user_id,
+        executions.append(
+            add_graph_execution(
+                user_id=webhook.user_id,
+                graph_id=node.graph_id,
+                graph_version=node.graph_version,
+                nodes_input_masks={node.id: {"payload": payload}},
+            )
         )
+    for preset in webhook.triggered_presets:
+        logger.debug(f"Webhook-attached preset: {preset}")
+        if not preset.is_active:
+            logger.debug(f"Preset #{preset.id} is inactive")
+            continue
+
+        graph = await get_graph(preset.graph_id, preset.graph_version, webhook.user_id)
+        if not graph:
+            logger.error(
+                f"User #{webhook.user_id} has preset #{preset.id} for graph "
+                f"#{preset.graph_id} v{preset.graph_version}, "
+                "but no access to the graph itself."
+            )
+            logger.info(f"Automatically deactivating broken preset #{preset.id}")
+            await update_preset(preset.user_id, preset.id, is_active=False)
+            continue
+        if not (trigger_node := graph.webhook_input_node):
+            # NOTE: this should NEVER happen, but we log and handle it gracefully
+            logger.error(
+                f"Preset #{preset.id} is triggered by webhook #{webhook.id}, but graph "
+                f"#{preset.graph_id} v{preset.graph_version} has no webhook input node"
+            )
+            await set_preset_webhook(preset.user_id, preset.id, None)
+            continue
+        if not trigger_node.block.is_triggered_by_event_type(preset.inputs, event_type):
+            logger.debug(f"Preset #{preset.id} doesn't trigger on event {event_type}")
+            continue
+        logger.debug(f"Executing preset #{preset.id} for webhook #{webhook.id}")
+
+        executions.append(
+            add_graph_execution(
+                user_id=webhook.user_id,
+                graph_id=preset.graph_id,
+                preset_id=preset.id,
+                graph_version=preset.graph_version,
+                graph_credentials_inputs=preset.credentials,
+                nodes_input_masks={
+                    trigger_node.id: {**preset.inputs, "payload": payload}
+                },
+            )
+        )
+    asyncio.gather(*executions)
 
 
-@router.post("/{provider}/webhooks/{webhook_id}/ping")
+@router.post("/webhooks/{webhook_id}/ping")
 async def webhook_ping(
-    provider: Annotated[str, Path(title="Provider where the webhook was registered")],
     webhook_id: Annotated[str, Path(title="Our ID for the webhook")],
     user_id: Annotated[str, Depends(get_user_id)],  # require auth
 ):
-    webhook_manager = WEBHOOK_MANAGERS_BY_NAME[provider]()
     webhook = await get_webhook(webhook_id)
+    webhook_manager = get_webhook_manager(webhook.provider)
 
-    await webhook_manager.trigger_ping(webhook)
-    if not await listen_for_webhook_event(webhook_id, event_type="ping"):
-        raise HTTPException(status_code=500, detail="Webhook ping event not received")
+    credentials = (
+        await creds_manager.get(user_id, webhook.credentials_id)
+        if webhook.credentials_id
+        else None
+    )
+    try:
+        await webhook_manager.trigger_ping(webhook, credentials)
+    except NotImplementedError:
+        return False
+
+    if not await wait_for_webhook_event(webhook_id, event_type="ping", timeout=10):
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Webhook ping timed out"
+        )
+
+    return True
 
 
 # --------------------------- UTILITIES ---------------------------- #
 
 
 async def remove_all_webhooks_for_credentials(
-    credentials: Credentials, force: bool = False
+    user_id: str, credentials: Credentials, force: bool = False
 ) -> None:
     """
     Remove and deregister all webhooks that were registered using the given credentials.
 
     Params:
+        user_id: The ID of the user who owns the credentials and webhooks.
         credentials: The credentials for which to remove the associated webhooks.
         force: Whether to proceed if any of the webhooks are still in use.
 
     Raises:
         NeedConfirmation: If any of the webhooks are still in use and `force` is `False`
     """
-    webhooks = await get_all_webhooks(credentials.id)
-    if any(w.attached_nodes for w in webhooks) and not force:
+    webhooks = await get_all_webhooks_by_creds(
+        user_id, credentials.id, include_relations=True
+    )
+    if any(w.triggered_nodes or w.triggered_presets for w in webhooks) and not force:
         raise NeedConfirmation(
             "Some webhooks linked to these credentials are still in use by an agent"
         )
     for webhook in webhooks:
-        # Unlink all nodes
-        for node in webhook.attached_nodes or []:
+        # Unlink all nodes & presets
+        for node in webhook.triggered_nodes:
             await set_node_webhook(node.id, None)
+        for preset in webhook.triggered_presets:
+            await set_preset_webhook(user_id, preset.id, None)
 
         # Prune the webhook
-        webhook_manager = WEBHOOK_MANAGERS_BY_NAME[credentials.provider]()
+        webhook_manager = get_webhook_manager(ProviderName(credentials.provider))
         success = await webhook_manager.prune_webhook_if_dangling(
-            webhook.id, credentials
+            user_id, webhook.id, credentials
         )
         if not success:
             logger.warning(f"Webhook #{webhook.id} failed to prune")
 
 
-def _get_provider_oauth_handler(req: Request, provider_name: str) -> BaseOAuthHandler:
+def _get_provider_oauth_handler(
+    req: Request, provider_name: ProviderName
+) -> "BaseOAuthHandler":
     if provider_name not in HANDLERS_BY_NAME:
         raise HTTPException(
-            status_code=404, detail=f"Unknown provider '{provider_name}'"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Provider '{provider_name.value}' does not support OAuth",
         )
 
-    client_id = getattr(settings.secrets, f"{provider_name}_client_id")
-    client_secret = getattr(settings.secrets, f"{provider_name}_client_secret")
+    client_id = getattr(settings.secrets, f"{provider_name.value}_client_id")
+    client_secret = getattr(settings.secrets, f"{provider_name.value}_client_secret")
     if not (client_id and client_secret):
+        logger.error(
+            f"Attempt to use unconfigured {provider_name.value} OAuth integration"
+        )
         raise HTTPException(
-            status_code=501,
-            detail=f"Integration with provider '{provider_name}' is not configured",
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={
+                "message": f"Integration with provider '{provider_name.value}' is not configured.",
+                "hint": "Set client ID and secret in the application's deployment environment",
+            },
         )
 
     handler_class = HANDLERS_BY_NAME[provider_name]

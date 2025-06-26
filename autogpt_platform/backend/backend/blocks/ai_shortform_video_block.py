@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from enum import Enum
@@ -12,7 +13,8 @@ from backend.data.model import (
     CredentialsMetaInput,
     SchemaField,
 )
-from backend.util.request import requests
+from backend.integrations.providers import ProviderName
+from backend.util.request import Requests
 
 TEST_CREDENTIALS = APIKeyCredentials(
     id="01234567-89ab-cdef-0123-456789abcdef",
@@ -140,13 +142,11 @@ logger = logging.getLogger(__name__)
 
 class AIShortformVideoCreatorBlock(Block):
     class Input(BlockSchema):
-        credentials: CredentialsMetaInput[Literal["revid"], Literal["api_key"]] = (
-            CredentialsField(
-                provider="revid",
-                supported_credential_types={"api_key"},
-                description="The revid.ai integration can be used with "
-                "any API key with sufficient permissions for the blocks it is used on.",
-            )
+        credentials: CredentialsMetaInput[
+            Literal[ProviderName.REVID], Literal["api_key"]
+        ] = CredentialsField(
+            description="The revid.ai integration can be used with "
+            "any API key with sufficient permissions for the blocks it is used on.",
         )
         script: str = SchemaField(
             description="""1. Use short and punctuated sentences\n\n2. Use linebreaks to create a new clip\n\n3. Text outside of brackets is spoken by the AI, and [text between brackets] will be used to guide the visual generation. For example, [close-up of a cat] will show a close-up of a cat.""",
@@ -217,29 +217,29 @@ class AIShortformVideoCreatorBlock(Block):
             test_credentials=TEST_CREDENTIALS,
         )
 
-    def create_webhook(self):
+    async def create_webhook(self):
         url = "https://webhook.site/token"
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        response = requests.post(url, headers=headers)
+        response = await Requests().post(url, headers=headers)
         webhook_data = response.json()
         return webhook_data["uuid"], f"https://webhook.site/{webhook_data['uuid']}"
 
-    def create_video(self, api_key: SecretStr, payload: dict) -> dict:
+    async def create_video(self, api_key: SecretStr, payload: dict) -> dict:
         url = "https://www.revid.ai/api/public/v2/render"
         headers = {"key": api_key.get_secret_value()}
-        response = requests.post(url, json=payload, headers=headers)
+        response = await Requests().post(url, json=payload, headers=headers)
         logger.debug(
-            f"API Response Status Code: {response.status_code}, Content: {response.text}"
+            f"API Response Status Code: {response.status}, Content: {response.text}"
         )
         return response.json()
 
-    def check_video_status(self, api_key: SecretStr, pid: str) -> dict:
+    async def check_video_status(self, api_key: SecretStr, pid: str) -> dict:
         url = f"https://www.revid.ai/api/public/v2/status?pid={pid}"
         headers = {"key": api_key.get_secret_value()}
-        response = requests.get(url, headers=headers)
+        response = await Requests().get(url, headers=headers)
         return response.json()
 
-    def wait_for_video(
+    async def wait_for_video(
         self,
         api_key: SecretStr,
         pid: str,
@@ -248,7 +248,7 @@ class AIShortformVideoCreatorBlock(Block):
     ) -> str:
         start_time = time.time()
         while time.time() - start_time < max_wait_time:
-            status = self.check_video_status(api_key, pid)
+            status = await self.check_video_status(api_key, pid)
             logger.debug(f"Video status: {status}")
 
             if status.get("status") == "ready" and "videoUrl" in status:
@@ -261,16 +261,16 @@ class AIShortformVideoCreatorBlock(Block):
                 logger.error(f"Video creation failed: {status.get('message')}")
                 raise ValueError(f"Video creation failed: {status.get('message')}")
 
-            time.sleep(10)
+            await asyncio.sleep(10)
 
         logger.error("Video creation timed out")
         raise TimeoutError("Video creation timed out")
 
-    def run(
+    async def run(
         self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
     ) -> BlockOutput:
         # Create a new Webhook.site URL
-        webhook_token, webhook_url = self.create_webhook()
+        webhook_token, webhook_url = await self.create_webhook()
         logger.debug(f"Webhook URL: {webhook_url}")
 
         audio_url = input_data.background_music.audio_url
@@ -307,7 +307,7 @@ class AIShortformVideoCreatorBlock(Block):
         }
 
         logger.debug("Creating video...")
-        response = self.create_video(credentials.api_key, payload)
+        response = await self.create_video(credentials.api_key, payload)
         pid = response.get("pid")
 
         if not pid:
@@ -319,6 +319,8 @@ class AIShortformVideoCreatorBlock(Block):
             logger.debug(
                 f"Video created with project ID: {pid}. Waiting for completion..."
             )
-            video_url = self.wait_for_video(credentials.api_key, pid, webhook_token)
+            video_url = await self.wait_for_video(
+                credentials.api_key, pid, webhook_token
+            )
             logger.debug(f"Video ready: {video_url}")
             yield "video_url", video_url

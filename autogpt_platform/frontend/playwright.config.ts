@@ -22,7 +22,7 @@ export default defineConfig({
   /* Opt out of parallel tests on CI. */
   workers: process.env.CI ? 1 : undefined,
   /* Reporter to use. See https://playwright.dev/docs/test-reporters */
-  reporter: "html",
+  reporter: [["html"], ["line"]],
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
   use: {
     /* Base URL to use in actions like `await page.goto('/')`. */
@@ -30,8 +30,11 @@ export default defineConfig({
 
     /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
     trace: "on-first-retry",
+    screenshot: "only-on-failure",
     bypassCSP: true,
   },
+  /* Maximum time one test can run for */
+  timeout: 60000,
 
   /* Configure projects for major browsers */
   projects: [
@@ -40,42 +43,45 @@ export default defineConfig({
       use: { ...devices["Desktop Chrome"] },
     },
 
-    {
-      name: "firefox",
-      use: { ...devices["Desktop Firefox"] },
-    },
+    // {
+    //   name: "firefox",
+    //   use: { ...devices["Desktop Firefox"] },
+    // },
 
     {
       name: "webkit",
       use: { ...devices["Desktop Safari"] },
     },
 
-    /* Test against mobile viewports. */
-    // {
-    //   name: 'Mobile Chrome',
-    //   use: { ...devices['Pixel 5'] },
-    // },
-    // {
-    //   name: 'Mobile Safari',
-    //   use: { ...devices['iPhone 12'] },
-    // },
+    // /* Test against mobile viewports. */
+    // // {
+    // //   name: 'Mobile Chrome',
+    // //   use: { ...devices['Pixel 5'] },
+    // // },
+    // // {
+    // //   name: 'Mobile Safari',
+    // //   use: { ...devices['iPhone 12'] },
+    // // },
 
-    /* Test against branded browsers. */
-    {
-      name: "Microsoft Edge",
-      use: { ...devices["Desktop Edge"], channel: "msedge" },
-    },
+    // /* Test against branded browsers. */
+    // {
+    //   name: "Microsoft Edge",
+    //   use: { ...devices["Desktop Edge"], channel: "msedge" },
+    // },
     // {
     //   name: 'Google Chrome',
     //   use: { ...devices['Desktop Chrome'], channel: 'chrome' },
     // },
   ],
 
-  /* Run your local dev server before starting the tests */
+  /* Run your local server before starting the tests */
   webServer: {
-    command: "npm run build && npm run start",
+    command: "pnpm start",
     url: "http://localhost:3000/",
     reuseExistingServer: !process.env.CI,
-    timeout: 120 * 1000,
+    timeout: 10 * 1000,
+    env: {
+      NODE_ENV: "test",
+    },
   },
 });

@@ -1,6 +1,7 @@
 import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
-import { Category } from "./autogpt-server-api/types";
+
+import { Category } from "@/lib/autogpt-server-api/types";
 import { NodeDimension } from "@/components/Flow";
 
 export function cn(...inputs: ClassValue[]) {
@@ -22,7 +23,7 @@ export function hashString(str: string): number {
 
 /** Derived from https://stackoverflow.com/a/32922084 */
 export function deepEquals(x: any, y: any): boolean {
-  const ok = Object.keys,
+  const ok = (obj: any) => Object.keys(obj).filter((key) => obj[key] !== null),
     tx = typeof x,
     ty = typeof y;
 
@@ -205,23 +206,25 @@ export function removeEmptyStringsAndNulls(obj: any): any {
 }
 
 export const categoryColorMap: Record<string, string> = {
-  AI: "bg-orange-300",
-  SOCIAL: "bg-yellow-300",
-  TEXT: "bg-green-300",
-  SEARCH: "bg-blue-300",
-  BASIC: "bg-purple-300",
-  INPUT: "bg-cyan-300",
-  OUTPUT: "bg-red-300",
-  LOGIC: "bg-teal-300",
-  DEVELOPER_TOOLS: "bg-fuchsia-300",
-  AGENT: "bg-lime-300",
+  AI: "bg-orange-300 dark:bg-orange-700",
+  SOCIAL: "bg-yellow-300 dark:bg-yellow-700",
+  TEXT: "bg-green-300 dark:bg-green-700",
+  SEARCH: "bg-blue-300 dark:bg-blue-700",
+  BASIC: "bg-purple-300 dark:bg-purple-700",
+  INPUT: "bg-cyan-300 dark:bg-cyan-700",
+  OUTPUT: "bg-red-300 dark:bg-red-700",
+  LOGIC: "bg-teal-300 dark:bg-teal-700",
+  DEVELOPER_TOOLS: "bg-fuchsia-300 dark:bg-fuchsia-700",
+  AGENT: "bg-lime-300 dark:bg-lime-700",
 };
 
 export function getPrimaryCategoryColor(categories: Category[]): string {
   if (categories.length === 0) {
-    return "bg-gray-300";
+    return "bg-gray-300 dark:bg-slate-700";
   }
-  return categoryColorMap[categories[0].category] || "bg-gray-300";
+  return (
+    categoryColorMap[categories[0].category] || "bg-gray-300 dark:bg-slate-700"
+  );
 }
 
 export function filterBlocksByType<T>(
@@ -240,6 +243,25 @@ export function getBehaveAs(): BehaveAs {
   return process.env.NEXT_PUBLIC_BEHAVE_AS === "CLOUD"
     ? BehaveAs.CLOUD
     : BehaveAs.LOCAL;
+}
+
+export enum AppEnv {
+  LOCAL = "local",
+  DEV = "dev",
+  PROD = "prod",
+}
+
+export function getAppEnv(): AppEnv {
+  const env = process.env.NEXT_PUBLIC_APP_ENV;
+  if (env === "dev") return AppEnv.DEV;
+  if (env === "prod") return AppEnv.PROD;
+  // Some places use prod and others production
+  if (env === "production") return AppEnv.PROD;
+  return AppEnv.LOCAL;
+}
+
+export function getEnvironmentStr(): string {
+  return `app:${getAppEnv().toLowerCase()}-behave:${getBehaveAs().toLowerCase()}`;
 }
 
 function rectanglesOverlap(
@@ -368,4 +390,14 @@ export function getValue(key: string, value: any) {
     }
     return acc[k.key];
   }, value);
+}
+
+/** Check if a string is empty or whitespace */
+export function isEmptyOrWhitespace(str: string | undefined | null): boolean {
+  return !str || str.trim().length === 0;
+}
+
+/** Check if a value is an object or not */
+export function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

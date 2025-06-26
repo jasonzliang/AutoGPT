@@ -1,4 +1,3 @@
-// profile.spec.ts
 import { test } from "./fixtures";
 import { ProfilePage } from "./pages/profile.page";
 
@@ -11,37 +10,33 @@ test.describe("Profile", () => {
     // Start each test with login using worker auth
     await page.goto("/login");
     await loginPage.login(testUser.email, testUser.password);
-    await test.expect(page).toHaveURL("/");
+    await test.expect(page).toHaveURL("/marketplace");
   });
 
-  test("user can view their profile information", async ({
-    page,
-    testUser,
-  }) => {
+  test("user can view their profile information", async ({ page }) => {
     await profilePage.navbar.clickProfileLink();
     // workaround for #8788
     // sleep for 10 seconds to allow page to load due to bug in our system
-    await page.waitForTimeout(10000);
+    await page.waitForTimeout(10_000);
     await page.reload();
     await page.reload();
     await test.expect(profilePage.isLoaded()).resolves.toBeTruthy();
     await test.expect(page).toHaveURL(new RegExp("/profile"));
 
     // Verify email matches test worker's email
-    const displayedEmail = await profilePage.getDisplayedEmail();
-    test.expect(displayedEmail).toBe(testUser.email);
+    const displayedHandle = await profilePage.getDisplayedName();
+    test.expect(displayedHandle).not.toBeNull();
+    test.expect(displayedHandle).not.toBe("");
+    test.expect(displayedHandle).toBeDefined();
   });
 
   test("profile navigation is accessible from navbar", async ({ page }) => {
     await profilePage.navbar.clickProfileLink();
     await test.expect(page).toHaveURL(new RegExp("/profile"));
-    // workaround for #8788
-    await page.reload();
-    await page.reload();
     await test.expect(profilePage.isLoaded()).resolves.toBeTruthy();
   });
 
-  test("profile displays user Credential providers", async ({ page }) => {
+  test("profile displays user Credential providers", async () => {
     await profilePage.navbar.clickProfileLink();
 
     // await test

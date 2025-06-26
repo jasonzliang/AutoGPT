@@ -4,18 +4,22 @@ import React, {
   forwardRef,
   useImperativeHandle,
 } from "react";
+import RunnerOutputUI, { BlockOutput } from "./runner-ui/RunnerOutputUI";
 import RunnerInputUI from "./runner-ui/RunnerInputUI";
-import RunnerOutputUI from "./runner-ui/RunnerOutputUI";
 import { Node } from "@xyflow/react";
 import { filterBlocksByType } from "@/lib/utils";
-import { BlockIORootSchema, BlockUIType } from "@/lib/autogpt-server-api/types";
+import {
+  BlockIOObjectSubSchema,
+  BlockIORootSchema,
+  BlockUIType,
+} from "@/lib/autogpt-server-api/types";
+import { CustomNode } from "./CustomNode";
 
 interface HardcodedValues {
   name: any;
   description: any;
   value: any;
   placeholder_values: any;
-  limit_to_placeholder_values: any;
 }
 
 export interface InputItem {
@@ -27,7 +31,7 @@ export interface InputItem {
 
 interface RunnerUIWrapperProps {
   nodes: Node[];
-  setNodes: React.Dispatch<React.SetStateAction<Node[]>>;
+  setNodes: React.Dispatch<React.SetStateAction<CustomNode[]>>;
   setIsScheduling: React.Dispatch<React.SetStateAction<boolean>>;
   isRunning: boolean;
   isScheduling: boolean;
@@ -59,7 +63,11 @@ const RunnerUIWrapper = forwardRef<RunnerUIWrapperRef, RunnerUIWrapperProps>(
     const [isRunnerOutputOpen, setIsRunnerOutputOpen] = useState(false);
     const [scheduledInput, setScheduledInput] = useState(false);
     const [cronExpression, setCronExpression] = useState("");
-    const getBlockInputsAndOutputs = useCallback(() => {
+
+    const getBlockInputsAndOutputs = useCallback((): {
+      inputs: InputItem[];
+      outputs: BlockOutput[];
+    } => {
       const inputBlocks = filterBlocksByType(
         nodes,
         (node) => node.data.uiType === BlockUIType.INPUT,
@@ -70,40 +78,44 @@ const RunnerUIWrapper = forwardRef<RunnerUIWrapperRef, RunnerUIWrapperProps>(
         (node) => node.data.uiType === BlockUIType.OUTPUT,
       );
 
-      const inputs = inputBlocks.map((node) => ({
-        id: node.id,
-        type: "input" as const,
-        inputSchema: node.data.inputSchema as BlockIORootSchema,
-        hardcodedValues: {
-          name: (node.data.hardcodedValues as any).name || "",
-          description: (node.data.hardcodedValues as any).description || "",
-          value: (node.data.hardcodedValues as any).value,
-          placeholder_values:
-            (node.data.hardcodedValues as any).placeholder_values || [],
-          limit_to_placeholder_values:
-            (node.data.hardcodedValues as any).limit_to_placeholder_values ||
-            false,
-        },
-      }));
+      const inputs = inputBlocks.map(
+        (node) =>
+          ({
+            id: node.id,
+            type: "input" as const,
+            inputSchema: (node.data.inputSchema as BlockIOObjectSubSchema)
+              .properties.value as BlockIORootSchema,
+            hardcodedValues: {
+              name: (node.data.hardcodedValues as any).name || "",
+              description: (node.data.hardcodedValues as any).description || "",
+              value: (node.data.hardcodedValues as any).value,
+              placeholder_values:
+                (node.data.hardcodedValues as any).placeholder_values || [],
+            },
+          }) satisfies InputItem,
+      );
 
-      const outputs = outputBlocks.map((node) => ({
-        id: node.id,
-        type: "output" as const,
-        hardcodedValues: {
-          name: (node.data.hardcodedValues as any).name || "Output",
-          description:
-            (node.data.hardcodedValues as any).description ||
-            "Output from the agent",
-          value: (node.data.hardcodedValues as any).value,
-        },
-        result: (node.data.executionResults as any)?.at(-1)?.data?.output,
-      }));
+      const outputs = outputBlocks.map(
+        (node) =>
+          ({
+            metadata: {
+              name: (node.data.hardcodedValues as any).name || "Output",
+              description:
+                (node.data.hardcodedValues as any).description ||
+                "Output from the agent",
+            },
+            result:
+              (node.data.executionResults as any)
+                ?.map((result: any) => result?.data?.output)
+                .join("\n--\n") || "No output yet",
+          }) satisfies BlockOutput,
+      );
 
       return { inputs, outputs };
     }, [nodes]);
 
     const handleInputChange = useCallback(
-      (nodeId: string, field: string, value: string) => {
+      (nodeId: string, field: string, value: any) => {
         setNodes((nds) =>
           nds.map((node) => {
             if (node.id === nodeId) {

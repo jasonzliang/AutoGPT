@@ -1,18 +1,21 @@
 import asyncio
 import logging
 from collections import defaultdict
-from typing import TYPE_CHECKING, Annotated, Any, Sequence
+from datetime import datetime
+from typing import Annotated, Any, Sequence
 
 import pydantic
+import stripe
 from autogpt_libs.auth.middleware import auth_middleware
 from autogpt_libs.feature_flag.client import feature_flag
 from autogpt_libs.utils.cache import thread_cached
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
+from starlette.status import HTTP_204_NO_CONTENT, HTTP_404_NOT_FOUND
 from typing_extensions import Optional, TypedDict
 
-import backend.data.block
 import backend.server.integrations.router
 import backend.server.routers.analytics
+import backend.server.v2.library.db as library_db
 from backend.data import execution as execution_db
 from backend.data import graph as graph_db
 from backend.data.api_key import (
@@ -27,11 +30,34 @@ from backend.data.api_key import (
     suspend_api_key,
     update_api_key_permissions,
 )
-from backend.data.block import BlockInput, CompletedBlockOutput
-from backend.data.credit import get_block_costs, get_user_credit_model
-from backend.data.user import get_or_create_user
-from backend.executor import ExecutionManager, ExecutionScheduler, scheduler
-from backend.integrations.creds_manager import IntegrationCredentialsManager
+from backend.data.block import BlockInput, CompletedBlockOutput, get_block, get_blocks
+from backend.data.credit import (
+    AutoTopUpConfig,
+    RefundRequest,
+    TransactionHistory,
+    get_auto_top_up,
+    get_block_costs,
+    get_user_credit_model,
+    set_auto_top_up,
+)
+from backend.data.execution import AsyncRedisExecutionEventBus
+from backend.data.model import CredentialsMetaInput
+from backend.data.notifications import NotificationPreference, NotificationPreferenceDTO
+from backend.data.onboarding import (
+    UserOnboardingUpdate,
+    get_recommended_agents,
+    get_user_onboarding,
+    onboarding_enabled,
+    update_user_onboarding,
+)
+from backend.data.user import (
+    get_or_create_user,
+    get_user_notification_preference,
+    update_user_email,
+    update_user_notification_preference,
+)
+from backend.executor import scheduler
+from backend.executor import utils as execution_utils
 from backend.integrations.webhooks.graph_lifecycle_hooks import (
     on_graph_activate,
     on_graph_deactivate,
@@ -40,6 +66,8 @@ from backend.server.model import (
     CreateAPIKeyRequest,
     CreateAPIKeyResponse,
     CreateGraph,
+    ExecuteGraphResponse,
+    RequestTopUp,
     SetGraphActiveVersion,
     UpdatePermissionsRequest,
 )
@@ -47,30 +75,24 @@ from backend.server.utils import get_user_id
 from backend.util.service import get_service_client
 from backend.util.settings import Settings
 
-if TYPE_CHECKING:
-    from backend.data.model import Credentials
+
+@thread_cached
+def execution_scheduler_client() -> scheduler.SchedulerClient:
+    return get_service_client(scheduler.SchedulerClient, health_check=False)
 
 
 @thread_cached
-def execution_manager_client() -> ExecutionManager:
-    return get_service_client(ExecutionManager)
-
-
-@thread_cached
-def execution_scheduler_client() -> ExecutionScheduler:
-    return get_service_client(ExecutionScheduler)
+def execution_event_bus() -> AsyncRedisExecutionEventBus:
+    return AsyncRedisExecutionEventBus()
 
 
 settings = Settings()
 logger = logging.getLogger(__name__)
-integration_creds_manager = IntegrationCredentialsManager()
-
 
 _user_credit_model = get_user_credit_model()
 
 # Define the API routes
-v1_router = APIRouter(prefix="/api")
-
+v1_router = APIRouter()
 
 v1_router.include_router(
     backend.server.integrations.router.router,
@@ -91,10 +113,105 @@ v1_router.include_router(
 ########################################################
 
 
-@v1_router.post("/auth/user", tags=["auth"], dependencies=[Depends(auth_middleware)])
+@v1_router.post(
+    "/auth/user",
+    summary="Get or create user",
+    tags=["auth"],
+    dependencies=[Depends(auth_middleware)],
+)
 async def get_or_create_user_route(user_data: dict = Depends(auth_middleware)):
     user = await get_or_create_user(user_data)
     return user.model_dump()
+
+
+@v1_router.post(
+    "/auth/user/email",
+    summary="Update user email",
+    tags=["auth"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def update_user_email_route(
+    user_id: Annotated[str, Depends(get_user_id)], email: str = Body(...)
+) -> dict[str, str]:
+    await update_user_email(user_id, email)
+
+    return {"email": email}
+
+
+@v1_router.get(
+    "/auth/user/preferences",
+    summary="Get notification preferences",
+    tags=["auth"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def get_preferences(
+    user_id: Annotated[str, Depends(get_user_id)],
+) -> NotificationPreference:
+    preferences = await get_user_notification_preference(user_id)
+    return preferences
+
+
+@v1_router.post(
+    "/auth/user/preferences",
+    summary="Update notification preferences",
+    tags=["auth"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def update_preferences(
+    user_id: Annotated[str, Depends(get_user_id)],
+    preferences: NotificationPreferenceDTO = Body(...),
+) -> NotificationPreference:
+    output = await update_user_notification_preference(user_id, preferences)
+    return output
+
+
+########################################################
+##################### Onboarding #######################
+########################################################
+
+
+@v1_router.get(
+    "/onboarding",
+    summary="Get onboarding status",
+    tags=["onboarding"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def get_onboarding(user_id: Annotated[str, Depends(get_user_id)]):
+    return await get_user_onboarding(user_id)
+
+
+@v1_router.patch(
+    "/onboarding",
+    summary="Update onboarding progress",
+    tags=["onboarding"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def update_onboarding(
+    user_id: Annotated[str, Depends(get_user_id)], data: UserOnboardingUpdate
+):
+    return await update_user_onboarding(user_id, data)
+
+
+@v1_router.get(
+    "/onboarding/agents",
+    summary="Get recommended agents",
+    tags=["onboarding"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def get_onboarding_agents(
+    user_id: Annotated[str, Depends(get_user_id)],
+):
+    return await get_recommended_agents(user_id)
+
+
+@v1_router.get(
+    "/onboarding/enabled",
+    summary="Check onboarding enabled",
+    tags=["onboarding", "public"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def is_onboarding_enabled():
+    return await onboarding_enabled()
 
 
 ########################################################
@@ -102,25 +219,33 @@ async def get_or_create_user_route(user_data: dict = Depends(auth_middleware)):
 ########################################################
 
 
-@v1_router.get(path="/blocks", tags=["blocks"], dependencies=[Depends(auth_middleware)])
+@v1_router.get(
+    path="/blocks",
+    summary="List available blocks",
+    tags=["blocks"],
+    dependencies=[Depends(auth_middleware)],
+)
 def get_graph_blocks() -> Sequence[dict[Any, Any]]:
-    blocks = [block() for block in backend.data.block.get_blocks().values()]
+    blocks = [block() for block in get_blocks().values()]
     costs = get_block_costs()
-    return [{**b.to_dict(), "costs": costs.get(b.id, [])} for b in blocks]
+    return [
+        {**b.to_dict(), "costs": costs.get(b.id, [])} for b in blocks if not b.disabled
+    ]
 
 
 @v1_router.post(
     path="/blocks/{block_id}/execute",
+    summary="Execute graph block",
     tags=["blocks"],
     dependencies=[Depends(auth_middleware)],
 )
-def execute_graph_block(block_id: str, data: BlockInput) -> CompletedBlockOutput:
-    obj = backend.data.block.get_block(block_id)
+async def execute_graph_block(block_id: str, data: BlockInput) -> CompletedBlockOutput:
+    obj = get_block(block_id)
     if not obj:
         raise HTTPException(status_code=404, detail=f"Block #{block_id} not found.")
 
     output = defaultdict(list)
-    for name, data in obj.execute(data):
+    async for name, data in obj.execute(data):
         output[name].append(data)
     return output
 
@@ -130,12 +255,181 @@ def execute_graph_block(block_id: str, data: BlockInput) -> CompletedBlockOutput
 ########################################################
 
 
-@v1_router.get(path="/credits", dependencies=[Depends(auth_middleware)])
+@v1_router.get(
+    path="/credits",
+    tags=["credits"],
+    summary="Get user credits",
+    dependencies=[Depends(auth_middleware)],
+)
 async def get_user_credits(
-    user_id: Annotated[str, Depends(get_user_id)]
+    user_id: Annotated[str, Depends(get_user_id)],
 ) -> dict[str, int]:
-    # Credits can go negative, so ensure it's at least 0 for user to see.
-    return {"credits": max(await _user_credit_model.get_or_refill_credit(user_id), 0)}
+    return {"credits": await _user_credit_model.get_credits(user_id)}
+
+
+@v1_router.post(
+    path="/credits",
+    summary="Request credit top up",
+    tags=["credits"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def request_top_up(
+    request: RequestTopUp, user_id: Annotated[str, Depends(get_user_id)]
+):
+    checkout_url = await _user_credit_model.top_up_intent(
+        user_id, request.credit_amount
+    )
+    return {"checkout_url": checkout_url}
+
+
+@v1_router.post(
+    path="/credits/{transaction_key}/refund",
+    summary="Refund credit transaction",
+    tags=["credits"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def refund_top_up(
+    user_id: Annotated[str, Depends(get_user_id)],
+    transaction_key: str,
+    metadata: dict[str, str],
+) -> int:
+    return await _user_credit_model.top_up_refund(user_id, transaction_key, metadata)
+
+
+@v1_router.patch(
+    path="/credits",
+    summary="Fulfill checkout session",
+    tags=["credits"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def fulfill_checkout(user_id: Annotated[str, Depends(get_user_id)]):
+    await _user_credit_model.fulfill_checkout(user_id=user_id)
+    return Response(status_code=200)
+
+
+@v1_router.post(
+    path="/credits/auto-top-up",
+    summary="Configure auto top up",
+    tags=["credits"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def configure_user_auto_top_up(
+    request: AutoTopUpConfig, user_id: Annotated[str, Depends(get_user_id)]
+) -> str:
+    if request.threshold < 0:
+        raise ValueError("Threshold must be greater than 0")
+    if request.amount < 500 and request.amount != 0:
+        raise ValueError("Amount must be greater than or equal to 500")
+    if request.amount < request.threshold:
+        raise ValueError("Amount must be greater than or equal to threshold")
+
+    current_balance = await _user_credit_model.get_credits(user_id)
+
+    if current_balance < request.threshold:
+        await _user_credit_model.top_up_credits(user_id, request.amount)
+    else:
+        await _user_credit_model.top_up_credits(user_id, 0)
+
+    await set_auto_top_up(
+        user_id, AutoTopUpConfig(threshold=request.threshold, amount=request.amount)
+    )
+    return "Auto top-up settings updated"
+
+
+@v1_router.get(
+    path="/credits/auto-top-up",
+    summary="Get auto top up",
+    tags=["credits"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def get_user_auto_top_up(
+    user_id: Annotated[str, Depends(get_user_id)],
+) -> AutoTopUpConfig:
+    return await get_auto_top_up(user_id)
+
+
+@v1_router.post(
+    path="/credits/stripe_webhook", summary="Handle Stripe webhooks", tags=["credits"]
+)
+async def stripe_webhook(request: Request):
+    # Get the raw request body
+    payload = await request.body()
+    # Get the signature header
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, settings.secrets.stripe_webhook_secret
+        )
+    except ValueError:
+        # Invalid payload
+        raise HTTPException(status_code=400)
+    except stripe.SignatureVerificationError:
+        # Invalid signature
+        raise HTTPException(status_code=400)
+
+    if (
+        event["type"] == "checkout.session.completed"
+        or event["type"] == "checkout.session.async_payment_succeeded"
+    ):
+        await _user_credit_model.fulfill_checkout(
+            session_id=event["data"]["object"]["id"]
+        )
+
+    if event["type"] == "charge.dispute.created":
+        await _user_credit_model.handle_dispute(event["data"]["object"])
+
+    if event["type"] == "refund.created" or event["type"] == "charge.dispute.closed":
+        await _user_credit_model.deduct_credits(event["data"]["object"])
+
+    return Response(status_code=200)
+
+
+@v1_router.get(
+    path="/credits/manage",
+    tags=["credits"],
+    summary="Manage payment methods",
+    dependencies=[Depends(auth_middleware)],
+)
+async def manage_payment_method(
+    user_id: Annotated[str, Depends(get_user_id)],
+) -> dict[str, str]:
+    return {"url": await _user_credit_model.create_billing_portal_session(user_id)}
+
+
+@v1_router.get(
+    path="/credits/transactions",
+    tags=["credits"],
+    summary="Get credit history",
+    dependencies=[Depends(auth_middleware)],
+)
+async def get_credit_history(
+    user_id: Annotated[str, Depends(get_user_id)],
+    transaction_time: datetime | None = None,
+    transaction_type: str | None = None,
+    transaction_count_limit: int = 100,
+) -> TransactionHistory:
+    if transaction_count_limit < 1 or transaction_count_limit > 1000:
+        raise ValueError("Transaction count limit must be between 1 and 1000")
+
+    return await _user_credit_model.get_transaction_history(
+        user_id=user_id,
+        transaction_time_ceiling=transaction_time,
+        transaction_count_limit=transaction_count_limit,
+        transaction_type=transaction_type,
+    )
+
+
+@v1_router.get(
+    path="/credits/refunds",
+    tags=["credits"],
+    summary="Get refund requests",
+    dependencies=[Depends(auth_middleware)],
+)
+async def get_refund_requests(
+    user_id: Annotated[str, Depends(get_user_id)],
+) -> list[RefundRequest]:
+    return await _user_credit_model.get_refund_requests(user_id)
 
 
 ########################################################
@@ -147,21 +441,27 @@ class DeleteGraphResponse(TypedDict):
     version_counts: int
 
 
-@v1_router.get(path="/graphs", tags=["graphs"], dependencies=[Depends(auth_middleware)])
+@v1_router.get(
+    path="/graphs",
+    summary="List user graphs",
+    tags=["graphs"],
+    dependencies=[Depends(auth_middleware)],
+)
 async def get_graphs(
     user_id: Annotated[str, Depends(get_user_id)],
-    with_runs: bool = False,
-) -> Sequence[graph_db.Graph]:
-    return await graph_db.get_graphs(
-        include_executions=with_runs, filter_by="active", user_id=user_id
-    )
+) -> Sequence[graph_db.GraphModel]:
+    return await graph_db.get_graphs(filter_by="active", user_id=user_id)
 
 
 @v1_router.get(
-    path="/graphs/{graph_id}", tags=["graphs"], dependencies=[Depends(auth_middleware)]
+    path="/graphs/{graph_id}",
+    summary="Get specific graph",
+    tags=["graphs"],
+    dependencies=[Depends(auth_middleware)],
 )
 @v1_router.get(
     path="/graphs/{graph_id}/versions/{version}",
+    summary="Get graph version",
     tags=["graphs"],
     dependencies=[Depends(auth_middleware)],
 )
@@ -169,10 +469,14 @@ async def get_graph(
     graph_id: str,
     user_id: Annotated[str, Depends(get_user_id)],
     version: int | None = None,
-    hide_credentials: bool = False,
-) -> graph_db.Graph:
+    for_export: bool = False,
+) -> graph_db.GraphModel:
     graph = await graph_db.get_graph(
-        graph_id, version, user_id=user_id, hide_credentials=hide_credentials
+        graph_id,
+        version,
+        user_id=user_id,
+        for_export=for_export,
+        include_subgraphs=True,  # needed to construct full credentials input schema
     )
     if not graph:
         raise HTTPException(status_code=404, detail=f"Graph #{graph_id} not found.")
@@ -181,17 +485,13 @@ async def get_graph(
 
 @v1_router.get(
     path="/graphs/{graph_id}/versions",
+    summary="Get all graph versions",
     tags=["graphs"],
-    dependencies=[Depends(auth_middleware)],
-)
-@v1_router.get(
-    path="/templates/{graph_id}/versions",
-    tags=["templates", "graphs"],
     dependencies=[Depends(auth_middleware)],
 )
 async def get_graph_all_versions(
     graph_id: str, user_id: Annotated[str, Depends(get_user_id)]
-) -> Sequence[graph_db.Graph]:
+) -> Sequence[graph_db.GraphModel]:
     graphs = await graph_db.get_graph_all_versions(graph_id, user_id=user_id)
     if not graphs:
         raise HTTPException(status_code=404, detail=f"Graph #{graph_id} not found.")
@@ -199,75 +499,57 @@ async def get_graph_all_versions(
 
 
 @v1_router.post(
-    path="/graphs", tags=["graphs"], dependencies=[Depends(auth_middleware)]
+    path="/graphs",
+    summary="Create new graph",
+    tags=["graphs"],
+    dependencies=[Depends(auth_middleware)],
 )
 async def create_new_graph(
-    create_graph: CreateGraph, user_id: Annotated[str, Depends(get_user_id)]
-) -> graph_db.Graph:
-    return await do_create_graph(create_graph, is_template=False, user_id=user_id)
-
-
-async def do_create_graph(
     create_graph: CreateGraph,
-    is_template: bool,
-    # user_id doesn't have to be annotated like on other endpoints,
-    # because create_graph isn't used directly as an endpoint
-    user_id: str,
-) -> graph_db.Graph:
-    if create_graph.graph:
-        graph = graph_db.make_graph_model(create_graph.graph, user_id)
-    elif create_graph.template_id:
-        # Create a new graph from a template
-        graph = await graph_db.get_graph(
-            create_graph.template_id,
-            create_graph.template_version,
-            template=True,
-            user_id=user_id,
-        )
-        if not graph:
-            raise HTTPException(
-                400, detail=f"Template #{create_graph.template_id} not found"
-            )
-        graph.version = 1
-    else:
-        raise HTTPException(
-            status_code=400, detail="Either graph or template_id must be provided."
-        )
-
-    graph.is_template = is_template
-    graph.is_active = not is_template
+    user_id: Annotated[str, Depends(get_user_id)],
+) -> graph_db.GraphModel:
+    graph = graph_db.make_graph_model(create_graph.graph, user_id)
     graph.reassign_ids(user_id=user_id, reassign_graph_id=True)
+    graph.validate_graph(for_run=False)
 
     graph = await graph_db.create_graph(graph, user_id=user_id)
-    graph = await on_graph_activate(
-        graph,
-        get_credentials=lambda id: integration_creds_manager.get(user_id, id),
+
+    # Create a library agent for the new graph
+    library_agent = await library_db.create_library_agent(graph, user_id)
+    _ = asyncio.create_task(
+        library_db.add_generated_agent_image(graph, library_agent.id)
     )
+
+    graph = await on_graph_activate(graph, user_id=user_id)
     return graph
 
 
 @v1_router.delete(
-    path="/graphs/{graph_id}", tags=["graphs"], dependencies=[Depends(auth_middleware)]
+    path="/graphs/{graph_id}",
+    summary="Delete graph permanently",
+    tags=["graphs"],
+    dependencies=[Depends(auth_middleware)],
 )
 async def delete_graph(
     graph_id: str, user_id: Annotated[str, Depends(get_user_id)]
 ) -> DeleteGraphResponse:
+    if active_version := await graph_db.get_graph(graph_id, user_id=user_id):
+        await on_graph_deactivate(active_version, user_id=user_id)
+
     return {"version_counts": await graph_db.delete_graph(graph_id, user_id=user_id)}
 
 
 @v1_router.put(
-    path="/graphs/{graph_id}", tags=["graphs"], dependencies=[Depends(auth_middleware)]
-)
-@v1_router.put(
-    path="/templates/{graph_id}",
-    tags=["templates", "graphs"],
+    path="/graphs/{graph_id}",
+    summary="Update graph version",
+    tags=["graphs"],
     dependencies=[Depends(auth_middleware)],
 )
 async def update_graph(
     graph_id: str,
     graph: graph_db.Graph,
     user_id: Annotated[str, Depends(get_user_id)],
-) -> graph_db.Graph:
+) -> graph_db.GraphModel:
     # Sanity check
     if graph.id and graph.id != graph_id:
         raise HTTPException(400, detail="Graph ID does not match ID in URI")
@@ -279,46 +561,35 @@ async def update_graph(
     latest_version_number = max(g.version for g in existing_versions)
     graph.version = latest_version_number + 1
 
-    latest_version_graph = next(
-        v for v in existing_versions if v.version == latest_version_number
-    )
     current_active_version = next((v for v in existing_versions if v.is_active), None)
-    if latest_version_graph.is_template != graph.is_template:
-        raise HTTPException(
-            400, detail="Changing is_template on an existing graph is forbidden"
-        )
-    graph.is_active = not graph.is_template
     graph = graph_db.make_graph_model(graph, user_id)
-    graph.reassign_ids(user_id=user_id)
+    graph.reassign_ids(user_id=user_id, reassign_graph_id=False)
+    graph.validate_graph(for_run=False)
 
     new_graph_version = await graph_db.create_graph(graph, user_id=user_id)
 
     if new_graph_version.is_active:
-
-        def get_credentials(credentials_id: str) -> "Credentials | None":
-            return integration_creds_manager.get(user_id, credentials_id)
+        # Keep the library agent up to date with the new active version
+        await library_db.update_agent_version_in_library(
+            user_id, graph.id, graph.version
+        )
 
         # Handle activation of the new graph first to ensure continuity
-        new_graph_version = await on_graph_activate(
-            new_graph_version,
-            get_credentials=get_credentials,
-        )
+        new_graph_version = await on_graph_activate(new_graph_version, user_id=user_id)
         # Ensure new version is the only active version
         await graph_db.set_graph_active_version(
             graph_id=graph_id, version=new_graph_version.version, user_id=user_id
         )
         if current_active_version:
             # Handle deactivation of the previously active version
-            await on_graph_deactivate(
-                current_active_version,
-                get_credentials=get_credentials,
-            )
+            await on_graph_deactivate(current_active_version, user_id=user_id)
 
     return new_graph_version
 
 
 @v1_router.put(
     path="/graphs/{graph_id}/versions/active",
+    summary="Set active graph version",
     tags=["graphs"],
     dependencies=[Depends(auth_middleware)],
 )
@@ -336,160 +607,156 @@ async def set_graph_active_version(
 
     current_active_graph = await graph_db.get_graph(graph_id, user_id=user_id)
 
-    def get_credentials(credentials_id: str) -> "Credentials | None":
-        return integration_creds_manager.get(user_id, credentials_id)
-
     # Handle activation of the new graph first to ensure continuity
-    await on_graph_activate(
-        new_active_graph,
-        get_credentials=get_credentials,
-    )
+    await on_graph_activate(new_active_graph, user_id=user_id)
     # Ensure new version is the only active version
     await graph_db.set_graph_active_version(
         graph_id=graph_id,
         version=new_active_version,
         user_id=user_id,
     )
+
+    # Keep the library agent up to date with the new active version
+    await library_db.update_agent_version_in_library(
+        user_id, new_active_graph.id, new_active_graph.version
+    )
+
     if current_active_graph and current_active_graph.version != new_active_version:
         # Handle deactivation of the previously active version
-        await on_graph_deactivate(
-            current_active_graph,
-            get_credentials=get_credentials,
-        )
+        await on_graph_deactivate(current_active_graph, user_id=user_id)
 
 
 @v1_router.post(
-    path="/graphs/{graph_id}/execute",
+    path="/graphs/{graph_id}/execute/{graph_version}",
+    summary="Execute graph agent",
     tags=["graphs"],
     dependencies=[Depends(auth_middleware)],
 )
-def execute_graph(
+async def execute_graph(
     graph_id: str,
-    node_input: dict[Any, Any],
     user_id: Annotated[str, Depends(get_user_id)],
-) -> dict[str, Any]:  # FIXME: add proper return type
-    try:
-        graph_exec = execution_manager_client().add_execution(
-            graph_id, node_input, user_id=user_id
+    inputs: Annotated[dict[str, Any], Body(..., embed=True, default_factory=dict)],
+    credentials_inputs: Annotated[
+        dict[str, CredentialsMetaInput], Body(..., embed=True, default_factory=dict)
+    ],
+    graph_version: Optional[int] = None,
+    preset_id: Optional[str] = None,
+) -> ExecuteGraphResponse:
+    current_balance = await _user_credit_model.get_credits(user_id)
+    if current_balance <= 0:
+        raise HTTPException(
+            status_code=402,
+            detail="Insufficient balance to execute the agent. Please top up your account.",
         )
-        return {"id": graph_exec.graph_exec_id}
-    except Exception as e:
-        msg = e.__str__().encode().decode("unicode_escape")
-        raise HTTPException(status_code=400, detail=msg)
+
+    graph_exec = await execution_utils.add_graph_execution(
+        graph_id=graph_id,
+        user_id=user_id,
+        inputs=inputs,
+        preset_id=preset_id,
+        graph_version=graph_version,
+        graph_credentials_inputs=credentials_inputs,
+    )
+    return ExecuteGraphResponse(graph_exec_id=graph_exec.id)
 
 
 @v1_router.post(
     path="/graphs/{graph_id}/executions/{graph_exec_id}/stop",
+    summary="Stop graph execution",
     tags=["graphs"],
     dependencies=[Depends(auth_middleware)],
 )
 async def stop_graph_run(
-    graph_exec_id: str, user_id: Annotated[str, Depends(get_user_id)]
-) -> Sequence[execution_db.ExecutionResult]:
-    if not await execution_db.get_graph_execution(graph_exec_id, user_id):
+    graph_id: str, graph_exec_id: str, user_id: Annotated[str, Depends(get_user_id)]
+) -> execution_db.GraphExecution:
+    if not await execution_db.get_graph_execution_meta(
+        user_id=user_id, execution_id=graph_exec_id
+    ):
         raise HTTPException(404, detail=f"Agent execution #{graph_exec_id} not found")
 
-    await asyncio.to_thread(
-        lambda: execution_manager_client().cancel_execution(graph_exec_id)
-    )
+    await execution_utils.stop_graph_execution(graph_exec_id)
 
     # Retrieve & return canceled graph execution in its final state
-    return await execution_db.get_execution_results(graph_exec_id)
+    result = await execution_db.get_graph_execution(
+        execution_id=graph_exec_id, user_id=user_id
+    )
+    if not result:
+        raise HTTPException(
+            500,
+            detail=f"Could not fetch graph execution #{graph_exec_id} after stopping",
+        )
+    return result
+
+
+@v1_router.get(
+    path="/executions",
+    summary="Get all executions",
+    tags=["graphs"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def get_graphs_executions(
+    user_id: Annotated[str, Depends(get_user_id)],
+) -> list[execution_db.GraphExecutionMeta]:
+    return await execution_db.get_graph_executions(user_id=user_id)
 
 
 @v1_router.get(
     path="/graphs/{graph_id}/executions",
+    summary="Get graph executions",
     tags=["graphs"],
     dependencies=[Depends(auth_middleware)],
 )
-async def list_graph_runs(
+async def get_graph_executions(
     graph_id: str,
     user_id: Annotated[str, Depends(get_user_id)],
-    graph_version: int | None = None,
-) -> Sequence[str]:
-    graph = await graph_db.get_graph(graph_id, graph_version, user_id=user_id)
-    if not graph:
-        rev = "" if graph_version is None else f" v{graph_version}"
-        raise HTTPException(
-            status_code=404, detail=f"Agent #{graph_id}{rev} not found."
-        )
-
-    return await execution_db.list_executions(graph_id, graph_version)
+) -> list[execution_db.GraphExecutionMeta]:
+    return await execution_db.get_graph_executions(graph_id=graph_id, user_id=user_id)
 
 
 @v1_router.get(
     path="/graphs/{graph_id}/executions/{graph_exec_id}",
+    summary="Get execution details",
     tags=["graphs"],
     dependencies=[Depends(auth_middleware)],
 )
-async def get_graph_run_node_execution_results(
+async def get_graph_execution(
     graph_id: str,
     graph_exec_id: str,
     user_id: Annotated[str, Depends(get_user_id)],
-) -> Sequence[execution_db.ExecutionResult]:
-    graph = await graph_db.get_graph(graph_id, user_id=user_id)
+) -> execution_db.GraphExecution | execution_db.GraphExecutionWithNodes:
+    graph = await graph_db.get_graph(graph_id=graph_id, user_id=user_id)
     if not graph:
-        raise HTTPException(status_code=404, detail=f"Graph #{graph_id} not found.")
-
-    return await execution_db.get_execution_results(graph_exec_id)
-
-
-# NOTE: This is used for testing
-async def get_graph_run_status(
-    graph_id: str,
-    graph_exec_id: str,
-    user_id: Annotated[str, Depends(get_user_id)],
-) -> execution_db.ExecutionStatus:
-    graph = await graph_db.get_graph(graph_id, user_id=user_id)
-    if not graph:
-        raise HTTPException(status_code=404, detail=f"Graph #{graph_id} not found.")
-
-    execution = await execution_db.get_graph_execution(graph_exec_id, user_id)
-    if not execution:
         raise HTTPException(
-            status_code=404, detail=f"Execution #{graph_exec_id} not found."
+            status_code=HTTP_404_NOT_FOUND, detail=f"Graph #{graph_id} not found"
         )
 
-    return execution.executionStatus
+    result = await execution_db.get_graph_execution(
+        user_id=user_id,
+        execution_id=graph_exec_id,
+        include_node_executions=graph.user_id == user_id,
+    )
+    if not result or result.graph_id != graph_id:
+        raise HTTPException(
+            status_code=404, detail=f"Graph execution #{graph_exec_id} not found."
+        )
+
+    return result
 
 
-########################################################
-##################### Templates ########################
-########################################################
-
-
-@v1_router.get(
-    path="/templates",
-    tags=["graphs", "templates"],
+@v1_router.delete(
+    path="/executions/{graph_exec_id}",
+    summary="Delete graph execution",
+    tags=["graphs"],
     dependencies=[Depends(auth_middleware)],
+    status_code=HTTP_204_NO_CONTENT,
 )
-async def get_templates(
-    user_id: Annotated[str, Depends(get_user_id)]
-) -> Sequence[graph_db.Graph]:
-    return await graph_db.get_graphs(filter_by="template", user_id=user_id)
-
-
-@v1_router.get(
-    path="/templates/{graph_id}",
-    tags=["templates", "graphs"],
-    dependencies=[Depends(auth_middleware)],
-)
-async def get_template(graph_id: str, version: int | None = None) -> graph_db.Graph:
-    graph = await graph_db.get_graph(graph_id, version, template=True)
-    if not graph:
-        raise HTTPException(status_code=404, detail=f"Template #{graph_id} not found.")
-    return graph
-
-
-@v1_router.post(
-    path="/templates",
-    tags=["templates", "graphs"],
-    dependencies=[Depends(auth_middleware)],
-)
-async def create_new_template(
-    create_graph: CreateGraph, user_id: Annotated[str, Depends(get_user_id)]
-) -> graph_db.Graph:
-    return await do_create_graph(create_graph, is_template=True, user_id=user_id)
+async def delete_graph_execution(
+    graph_exec_id: str,
+    user_id: Annotated[str, Depends(get_user_id)],
+) -> None:
+    await execution_db.delete_graph_execution(
+        graph_exec_id=graph_exec_id, user_id=user_id
+    )
 
 
 ########################################################
@@ -501,57 +768,62 @@ class ScheduleCreationRequest(pydantic.BaseModel):
     cron: str
     input_data: dict[Any, Any]
     graph_id: str
+    graph_version: int
 
 
 @v1_router.post(
     path="/schedules",
+    summary="Create execution schedule",
     tags=["schedules"],
     dependencies=[Depends(auth_middleware)],
 )
 async def create_schedule(
     user_id: Annotated[str, Depends(get_user_id)],
     schedule: ScheduleCreationRequest,
-) -> scheduler.JobInfo:
-    graph = await graph_db.get_graph(schedule.graph_id, user_id=user_id)
+) -> scheduler.GraphExecutionJobInfo:
+    graph = await graph_db.get_graph(
+        schedule.graph_id, schedule.graph_version, user_id=user_id
+    )
     if not graph:
         raise HTTPException(
-            status_code=404, detail=f"Graph #{schedule.graph_id} not found."
+            status_code=404,
+            detail=f"Graph #{schedule.graph_id} v.{schedule.graph_version} not found.",
         )
 
-    return await asyncio.to_thread(
-        lambda: execution_scheduler_client().add_execution_schedule(
-            graph_id=schedule.graph_id,
-            graph_version=graph.version,
-            cron=schedule.cron,
-            input_data=schedule.input_data,
-            user_id=user_id,
-        )
+    return await execution_scheduler_client().add_execution_schedule(
+        graph_id=schedule.graph_id,
+        graph_version=graph.version,
+        cron=schedule.cron,
+        input_data=schedule.input_data,
+        user_id=user_id,
     )
 
 
 @v1_router.delete(
     path="/schedules/{schedule_id}",
+    summary="Delete execution schedule",
     tags=["schedules"],
     dependencies=[Depends(auth_middleware)],
 )
-def delete_schedule(
+async def delete_schedule(
     schedule_id: str,
     user_id: Annotated[str, Depends(get_user_id)],
 ) -> dict[Any, Any]:
-    execution_scheduler_client().delete_schedule(schedule_id, user_id=user_id)
+    await execution_scheduler_client().delete_schedule(schedule_id, user_id=user_id)
     return {"id": schedule_id}
 
 
 @v1_router.get(
     path="/schedules",
+    summary="List execution schedules",
     tags=["schedules"],
     dependencies=[Depends(auth_middleware)],
 )
-def get_execution_schedules(
+async def get_execution_schedules(
     user_id: Annotated[str, Depends(get_user_id)],
     graph_id: str | None = None,
-) -> list[scheduler.JobInfo]:
-    return execution_scheduler_client().get_execution_schedules(
+) -> list[scheduler.GraphExecutionJobInfo]:
+    return await execution_scheduler_client().get_execution_schedules(
         user_id=user_id,
         graph_id=graph_id,
     )
@@ -564,11 +836,11 @@ def get_execution_schedules(
 
 @v1_router.post(
     "/api-keys",
-    response_model=list[CreateAPIKeyResponse] | dict[str, str],
+    summary="Create new API key",
+    response_model=CreateAPIKeyResponse,
     tags=["api-keys"],
     dependencies=[Depends(auth_middleware)],
 )
-@feature_flag("api-keys-enabled")
 async def create_api_key(
     request: CreateAPIKeyRequest, user_id: Annotated[str, Depends(get_user_id)]
 ) -> CreateAPIKeyResponse:
@@ -582,35 +854,45 @@ async def create_api_key(
         )
         return CreateAPIKeyResponse(api_key=api_key, plain_text_key=plain_text)
     except APIKeyError as e:
-        logger.error(f"Failed to create API key: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(
+            "Could not create API key for user %s: %s. Review input and permissions.",
+            user_id,
+            e,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(e), "hint": "Verify request payload and try again."},
+        )
 
 
 @v1_router.get(
     "/api-keys",
+    summary="List user API keys",
     response_model=list[APIKeyWithoutHash] | dict[str, str],
     tags=["api-keys"],
     dependencies=[Depends(auth_middleware)],
 )
-@feature_flag("api-keys-enabled")
 async def get_api_keys(
-    user_id: Annotated[str, Depends(get_user_id)]
+    user_id: Annotated[str, Depends(get_user_id)],
 ) -> list[APIKeyWithoutHash]:
     """List all API keys for the user"""
     try:
         return await list_user_api_keys(user_id)
     except APIKeyError as e:
-        logger.error(f"Failed to list API keys: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error("Failed to list API keys for user %s: %s", user_id, e)
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(e), "hint": "Check API key service availability."},
+        )
 
 
 @v1_router.get(
     "/api-keys/{key_id}",
-    response_model=list[APIKeyWithoutHash] | dict[str, str],
+    summary="Get specific API key",
+    response_model=APIKeyWithoutHash,
     tags=["api-keys"],
     dependencies=[Depends(auth_middleware)],
 )
-@feature_flag("api-keys-enabled")
 async def get_api_key(
     key_id: str, user_id: Annotated[str, Depends(get_user_id)]
 ) -> APIKeyWithoutHash:
@@ -621,13 +903,17 @@ async def get_api_key(
             raise HTTPException(status_code=404, detail="API key not found")
         return api_key
     except APIKeyError as e:
-        logger.error(f"Failed to get API key: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error("Error retrieving API key %s for user %s: %s", key_id, user_id, e)
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(e), "hint": "Ensure the key ID is correct."},
+        )
 
 
 @v1_router.delete(
     "/api-keys/{key_id}",
-    response_model=list[APIKeyWithoutHash] | dict[str, str],
+    summary="Revoke API key",
+    response_model=APIKeyWithoutHash,
     tags=["api-keys"],
     dependencies=[Depends(auth_middleware)],
 )
@@ -643,13 +929,20 @@ async def delete_api_key(
     except APIKeyPermissionError:
         raise HTTPException(status_code=403, detail="Permission denied")
     except APIKeyError as e:
-        logger.error(f"Failed to revoke API key: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error("Failed to revoke API key %s for user %s: %s", key_id, user_id, e)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": str(e),
+                "hint": "Verify permissions or try again later.",
+            },
+        )
 
 
 @v1_router.post(
     "/api-keys/{key_id}/suspend",
-    response_model=list[APIKeyWithoutHash] | dict[str, str],
+    summary="Suspend API key",
+    response_model=APIKeyWithoutHash,
     tags=["api-keys"],
     dependencies=[Depends(auth_middleware)],
 )
@@ -665,13 +958,17 @@ async def suspend_key(
     except APIKeyPermissionError:
         raise HTTPException(status_code=403, detail="Permission denied")
     except APIKeyError as e:
-        logger.error(f"Failed to suspend API key: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error("Failed to suspend API key %s for user %s: %s", key_id, user_id, e)
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(e), "hint": "Check user permissions and retry."},
+        )
 
 
 @v1_router.put(
     "/api-keys/{key_id}/permissions",
-    response_model=list[APIKeyWithoutHash] | dict[str, str],
+    summary="Update key permissions",
+    response_model=APIKeyWithoutHash,
     tags=["api-keys"],
     dependencies=[Depends(auth_middleware)],
 )
@@ -689,5 +986,13 @@ async def update_permissions(
     except APIKeyPermissionError:
         raise HTTPException(status_code=403, detail="Permission denied")
     except APIKeyError as e:
-        logger.error(f"Failed to update API key permissions: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(
+            "Failed to update permissions for API key %s of user %s: %s",
+            key_id,
+            user_id,
+            e,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(e), "hint": "Ensure permissions list is valid."},
+        )

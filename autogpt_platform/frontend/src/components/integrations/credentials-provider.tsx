@@ -1,18 +1,15 @@
-import AutoGPTServerAPI, {
+import { createContext, useCallback, useEffect, useState } from "react";
+import { useSupabase } from "@/lib/supabase/hooks/useSupabase";
+import {
   APIKeyCredentials,
   CredentialsDeleteNeedConfirmationResponse,
   CredentialsDeleteResponse,
   CredentialsMetaResponse,
   CredentialsProviderName,
   PROVIDER_NAMES,
+  UserPasswordCredentials,
 } from "@/lib/autogpt-server-api";
-import {
-  createContext,
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-} from "react";
+import { useBackendAPI } from "@/lib/autogpt-server-api/context";
 
 // Get keys from CredentialsProviderName type
 const CREDENTIALS_PROVIDER_NAMES = Object.values(
@@ -21,27 +18,43 @@ const CREDENTIALS_PROVIDER_NAMES = Object.values(
 
 // --8<-- [start:CredentialsProviderNames]
 const providerDisplayNames: Record<CredentialsProviderName, string> = {
+  aiml_api: "AI/ML",
   anthropic: "Anthropic",
+  apollo: "Apollo",
   discord: "Discord",
   d_id: "D-ID",
+  e2b: "E2B",
+  exa: "Exa",
+  fal: "FAL",
   github: "GitHub",
   google: "Google",
   google_maps: "Google Maps",
   groq: "Groq",
+  hubspot: "Hubspot",
   ideogram: "Ideogram",
   jina: "Jina",
+  linear: "Linear",
   medium: "Medium",
+  mem0: "Mem0",
   notion: "Notion",
+  nvidia: "Nvidia",
   ollama: "Ollama",
   openai: "OpenAI",
   openweathermap: "OpenWeatherMap",
   open_router: "Open Router",
+  llama_api: "Llama API",
   pinecone: "Pinecone",
+  screenshotone: "ScreenshotOne",
+  slant3d: "Slant3D",
+  smartlead: "SmartLead",
+  smtp: "SMTP",
+  reddit: "Reddit",
   replicate: "Replicate",
-  fal: "FAL",
   revid: "Rev.ID",
+  twitter: "Twitter",
+  todoist: "Todoist",
   unreal_speech: "Unreal Speech",
-  hubspot: "Hubspot",
+  zerobounce: "ZeroBounce",
 } as const;
 // --8<-- [end:CredentialsProviderNames]
 
@@ -50,17 +63,24 @@ type APIKeyCredentialsCreatable = Omit<
   "id" | "provider" | "type"
 >;
 
+type UserPasswordCredentialsCreatable = Omit<
+  UserPasswordCredentials,
+  "id" | "provider" | "type"
+>;
+
 export type CredentialsProviderData = {
   provider: CredentialsProviderName;
   providerName: string;
-  savedApiKeys: CredentialsMetaResponse[];
-  savedOAuthCredentials: CredentialsMetaResponse[];
+  savedCredentials: CredentialsMetaResponse[];
   oAuthCallback: (
     code: string,
     state_token: string,
   ) => Promise<CredentialsMetaResponse>;
   createAPIKeyCredentials: (
     credentials: APIKeyCredentialsCreatable,
+  ) => Promise<CredentialsMetaResponse>;
+  createUserPasswordCredentials: (
+    credentials: UserPasswordCredentialsCreatable,
   ) => Promise<CredentialsMetaResponse>;
   deleteCredentials: (
     id: string,
@@ -84,7 +104,8 @@ export default function CredentialsProvider({
 }) {
   const [providers, setProviders] =
     useState<CredentialsProvidersContextType | null>(null);
-  const api = useMemo(() => new AutoGPTServerAPI(), []);
+  const { isLoggedIn } = useSupabase();
+  const api = useBackendAPI();
 
   const addCredentials = useCallback(
     (
@@ -94,30 +115,19 @@ export default function CredentialsProvider({
       setProviders((prev) => {
         if (!prev || !prev[provider]) return prev;
 
-        const updatedProvider = { ...prev[provider] };
-
-        if (credentials.type === "api_key") {
-          updatedProvider.savedApiKeys = [
-            ...updatedProvider.savedApiKeys,
-            credentials,
-          ];
-        } else if (credentials.type === "oauth2") {
-          updatedProvider.savedOAuthCredentials = [
-            ...updatedProvider.savedOAuthCredentials,
-            credentials,
-          ];
-        }
-
         return {
           ...prev,
-          [provider]: updatedProvider,
+          [provider]: {
+            ...prev[provider],
+            savedCredentials: [...prev[provider].savedCredentials, credentials],
+          },
         };
       });
     },
     [setProviders],
   );
 
-  /** Wraps `AutoGPTServerAPI.oAuthCallback`, and adds the result to the internal credentials store. */
+  /** Wraps `BackendAPI.oAuthCallback`, and adds the result to the internal credentials store. */
   const oAuthCallback = useCallback(
     async (
       provider: CredentialsProviderName,
@@ -131,7 +141,7 @@ export default function CredentialsProvider({
     [api, addCredentials],
   );
 
-  /** Wraps `AutoGPTServerAPI.createAPIKeyCredentials`, and adds the result to the internal credentials store. */
+  /** Wraps `BackendAPI.createAPIKeyCredentials`, and adds the result to the internal credentials store. */
   const createAPIKeyCredentials = useCallback(
     async (
       provider: CredentialsProviderName,
@@ -147,7 +157,23 @@ export default function CredentialsProvider({
     [api, addCredentials],
   );
 
-  /** Wraps `AutoGPTServerAPI.deleteCredentials`, and removes the credentials from the internal store. */
+  /** Wraps `BackendAPI.createUserPasswordCredentials`, and adds the result to the internal credentials store. */
+  const createUserPasswordCredentials = useCallback(
+    async (
+      provider: CredentialsProviderName,
+      credentials: UserPasswordCredentialsCreatable,
+    ): Promise<CredentialsMetaResponse> => {
+      const credsMeta = await api.createUserPasswordCredentials({
+        provider,
+        ...credentials,
+      });
+      addCredentials(provider, credsMeta);
+      return credsMeta;
+    },
+    [api, addCredentials],
+  );
+
+  /** Wraps `BackendAPI.deleteCredentials`, and removes the credentials from the internal store. */
   const deleteCredentials = useCallback(
     async (
       provider: CredentialsProviderName,
@@ -163,18 +189,14 @@ export default function CredentialsProvider({
       setProviders((prev) => {
         if (!prev || !prev[provider]) return prev;
 
-        const updatedProvider = { ...prev[provider] };
-        updatedProvider.savedApiKeys = updatedProvider.savedApiKeys.filter(
-          (cred) => cred.id !== id,
-        );
-        updatedProvider.savedOAuthCredentials =
-          updatedProvider.savedOAuthCredentials.filter(
-            (cred) => cred.id !== id,
-          );
-
         return {
           ...prev,
-          [provider]: updatedProvider,
+          [provider]: {
+            ...prev[provider],
+            savedCredentials: prev[provider].savedCredentials.filter(
+              (cred) => cred.id !== id,
+            ),
+          },
         };
       });
       return result;
@@ -183,69 +205,55 @@ export default function CredentialsProvider({
   );
 
   useEffect(() => {
-    api.isAuthenticated().then((isAuthenticated) => {
-      if (!isAuthenticated) return;
+    if (!isLoggedIn) {
+      if (isLoggedIn == false) setProviders(null);
+      return;
+    }
 
-      api.listCredentials().then((response) => {
-        const credentialsByProvider = response.reduce(
-          (acc, cred) => {
-            if (!acc[cred.provider]) {
-              acc[cred.provider] = { oauthCreds: [], apiKeys: [] };
-            }
-            if (cred.type === "oauth2") {
-              acc[cred.provider].oauthCreds.push(cred);
-            } else if (cred.type === "api_key") {
-              acc[cred.provider].apiKeys.push(cred);
-            }
-            return acc;
-          },
-          {} as Record<
-            CredentialsProviderName,
+    api.listCredentials().then((response) => {
+      const credentialsByProvider = response.reduce(
+        (acc, cred) => {
+          if (!acc[cred.provider]) {
+            acc[cred.provider] = [];
+          }
+          acc[cred.provider].push(cred);
+          return acc;
+        },
+        {} as Record<CredentialsProviderName, CredentialsMetaResponse[]>,
+      );
+
+      setProviders((prev) => ({
+        ...prev,
+        ...Object.fromEntries(
+          CREDENTIALS_PROVIDER_NAMES.map((provider) => [
+            provider,
             {
-              oauthCreds: CredentialsMetaResponse[];
-              apiKeys: CredentialsMetaResponse[];
-            }
-          >,
-        );
-
-        setProviders((prev) => ({
-          ...prev,
-          ...Object.fromEntries(
-            CREDENTIALS_PROVIDER_NAMES.map((provider) => [
               provider,
-              {
-                provider,
-                providerName:
-                  providerDisplayNames[provider as CredentialsProviderName],
-                savedApiKeys: credentialsByProvider[provider]?.apiKeys ?? [],
-                savedOAuthCredentials:
-                  credentialsByProvider[provider]?.oauthCreds ?? [],
-                oAuthCallback: (code: string, state_token: string) =>
-                  oAuthCallback(
-                    provider as CredentialsProviderName,
-                    code,
-                    state_token,
-                  ),
-                createAPIKeyCredentials: (
-                  credentials: APIKeyCredentialsCreatable,
-                ) =>
-                  createAPIKeyCredentials(
-                    provider as CredentialsProviderName,
-                    credentials,
-                  ),
-                deleteCredentials: (id: string, force: boolean = false) =>
-                  deleteCredentials(
-                    provider as CredentialsProviderName,
-                    id,
-                    force,
-                  ),
-              },
-            ]),
-          ),
-        }));
-      });
+              providerName: providerDisplayNames[provider],
+              savedCredentials: credentialsByProvider[provider] ?? [],
+              oAuthCallback: (code: string, state_token: string) =>
+                oAuthCallback(provider, code, state_token),
+              createAPIKeyCredentials: (
+                credentials: APIKeyCredentialsCreatable,
+              ) => createAPIKeyCredentials(provider, credentials),
+              createUserPasswordCredentials: (
+                credentials: UserPasswordCredentialsCreatable,
+              ) => createUserPasswordCredentials(provider, credentials),
+              deleteCredentials: (id: string, force: boolean = false) =>
+                deleteCredentials(provider, id, force),
+            } satisfies CredentialsProviderData,
+          ]),
+        ),
+      }));
     });
-  }, [api, createAPIKeyCredentials, deleteCredentials, oAuthCallback]);
+  }, [
+    api,
+    isLoggedIn,
+    createAPIKeyCredentials,
+    createUserPasswordCredentials,
+    deleteCredentials,
+    oAuthCallback,
+  ]);
 
   return (
     <CredentialsProvidersContext.Provider value={providers}>

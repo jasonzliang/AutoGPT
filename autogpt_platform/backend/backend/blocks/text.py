@@ -1,13 +1,11 @@
 import re
 from typing import Any
 
-from jinja2 import BaseLoader, Environment
-
 from backend.data.block import Block, BlockCategory, BlockOutput, BlockSchema
 from backend.data.model import SchemaField
-from backend.util import json
+from backend.util import json, text
 
-jinja = Environment(loader=BaseLoader())
+formatter = text.TextFormatter()
 
 
 class MatchTextPatternBlock(Block):
@@ -45,7 +43,7 @@ class MatchTextPatternBlock(Block):
             ],
         )
 
-    def run(self, input_data: Input, **kwargs) -> BlockOutput:
+    async def run(self, input_data: Input, **kwargs) -> BlockOutput:
         output = input_data.data or input_data.text
         flags = 0
         if not input_data.case_sensitive:
@@ -73,10 +71,13 @@ class ExtractTextInformationBlock(Block):
             description="Case sensitive match", default=True
         )
         dot_all: bool = SchemaField(description="Dot matches all", default=True)
+        find_all: bool = SchemaField(description="Find all matches", default=False)
 
     class Output(BlockSchema):
         positive: str = SchemaField(description="Extracted text")
         negative: str = SchemaField(description="Original text")
+        matched_results: list[str] = SchemaField(description="List of matched results")
+        matched_count: int = SchemaField(description="Number of matched results")
 
     def __init__(self):
         super().__init__(
@@ -90,16 +91,49 @@ class ExtractTextInformationBlock(Block):
                 {"text": "Hello, World!", "pattern": "Hello, (.+)", "group": 0},
                 {"text": "Hello, World!", "pattern": "Hello, (.+)", "group": 2},
                 {"text": "Hello, World!", "pattern": "hello,", "case_sensitive": False},
+                {
+                    "text": "Hello, World!! Hello, Earth!!",
+                    "pattern": "Hello, (\\S+)",
+                    "group": 1,
+                    "find_all": False,
+                },
+                {
+                    "text": "Hello, World!! Hello, Earth!!",
+                    "pattern": "Hello, (\\S+)",
+                    "group": 1,
+                    "find_all": True,
+                },
             ],
             test_output=[
+                # Test case 1
                 ("positive", "World!"),
+                ("matched_results", ["World!"]),
+                ("matched_count", 1),
+                # Test case 2
                 ("positive", "Hello, World!"),
+                ("matched_results", ["Hello, World!"]),
+                ("matched_count", 1),
+                # Test case 3
                 ("negative", "Hello, World!"),
+                ("matched_results", []),
+                ("matched_count", 0),
+                # Test case 4
                 ("positive", "Hello,"),
+                ("matched_results", ["Hello,"]),
+                ("matched_count", 1),
+                # Test case 5
+                ("positive", "World!!"),
+                ("matched_results", ["World!!"]),
+                ("matched_count", 1),
+                # Test case 6
+                ("positive", "World!!"),
+                ("positive", "Earth!!"),
+                ("matched_results", ["World!!", "Earth!!"]),
+                ("matched_count", 2),
             ],
         )
 
-    def run(self, input_data: Input, **kwargs) -> BlockOutput:
+    async def run(self, input_data: Input, **kwargs) -> BlockOutput:
         flags = 0
         if not input_data.case_sensitive:
             flags = flags | re.IGNORECASE
@@ -107,24 +141,33 @@ class ExtractTextInformationBlock(Block):
             flags = flags | re.DOTALL
 
         if isinstance(input_data.text, str):
-            text = input_data.text
+            txt = input_data.text
         else:
-            text = json.dumps(input_data.text)
+            txt = json.dumps(input_data.text)
 
-        match = re.search(input_data.pattern, text, flags)
-        if match and input_data.group <= len(match.groups()):
-            yield "positive", match.group(input_data.group)
-        else:
-            yield "negative", text
+        matches = [
+            match.group(input_data.group)
+            for match in re.finditer(input_data.pattern, txt, flags)
+            if input_data.group <= len(match.groups())
+        ]
+        if not input_data.find_all:
+            matches = matches[:1]
+        for match in matches:
+            yield "positive", match
+        if not matches:
+            yield "negative", input_data.text
+
+        yield "matched_results", matches
+        yield "matched_count", len(matches)
 
 
 class FillTextTemplateBlock(Block):
     class Input(BlockSchema):
         values: dict[str, Any] = SchemaField(
-            description="Values (dict) to be used in format"
+            description="Values (dict) to be used in format. These values can be used by putting them in double curly braces in the format template. e.g. {{value_name}}.",
         )
         format: str = SchemaField(
-            description="Template to format the text using `values`"
+            description="Template to format the text using `values`. Use Jinja2 syntax."
         )
 
     class Output(BlockSchema):
@@ -140,25 +183,26 @@ class FillTextTemplateBlock(Block):
             test_input=[
                 {
                     "values": {"name": "Alice", "hello": "Hello", "world": "World!"},
-                    "format": "{hello}, {world} {{name}}",
+                    "format": "{{hello}}, {{ world }} {{name}}",
                 },
                 {
                     "values": {"list": ["Hello", " World!"]},
                     "format": "{% for item in list %}{{ item }}{% endfor %}",
                 },
+                {
+                    "values": {},
+                    "format": "{% set name = 'Alice' %}Hello, World! {{ name }}",
+                },
             ],
             test_output=[
                 ("output", "Hello, World! Alice"),
                 ("output", "Hello World!"),
+                ("output", "Hello, World! Alice"),
             ],
         )
 
-    def run(self, input_data: Input, **kwargs) -> BlockOutput:
-        # For python.format compatibility: replace all {...} with {{..}}.
-        # But avoid replacing {{...}} to {{{...}}}.
-        fmt = re.sub(r"(?<!{){[ a-zA-Z0-9_]+}", r"{\g<0>}", input_data.format)
-        template = jinja.from_string(fmt)
-        yield "output", template.render(**input_data.values)
+    async def run(self, input_data: Input, **kwargs) -> BlockOutput:
+        yield "output", formatter.format_string(input_data.format, input_data.values)
 
 
 class CombineTextsBlock(Block):
@@ -188,6 +232,74 @@ class CombineTextsBlock(Block):
             ],
         )
 
-    def run(self, input_data: Input, **kwargs) -> BlockOutput:
+    async def run(self, input_data: Input, **kwargs) -> BlockOutput:
         combined_text = input_data.delimiter.join(input_data.input)
         yield "output", combined_text
+
+
+class TextSplitBlock(Block):
+    class Input(BlockSchema):
+        text: str = SchemaField(description="The text to split.")
+        delimiter: str = SchemaField(description="The delimiter to split the text by.")
+        strip: bool = SchemaField(
+            description="Whether to strip the text.", default=True
+        )
+
+    class Output(BlockSchema):
+        texts: list[str] = SchemaField(
+            description="The text split into a list of strings."
+        )
+
+    def __init__(self):
+        super().__init__(
+            id="d5ea33c8-a575-477a-b42f-2fe3be5055ec",
+            description="This block is used to split a text into a list of strings.",
+            categories={BlockCategory.TEXT},
+            input_schema=TextSplitBlock.Input,
+            output_schema=TextSplitBlock.Output,
+            test_input=[
+                {"text": "Hello, World!", "delimiter": ","},
+                {"text": "Hello, World!", "delimiter": ",", "strip": False},
+            ],
+            test_output=[
+                ("texts", ["Hello", "World!"]),
+                ("texts", ["Hello", " World!"]),
+            ],
+        )
+
+    async def run(self, input_data: Input, **kwargs) -> BlockOutput:
+        if len(input_data.text) == 0:
+            yield "texts", []
+        else:
+            texts = input_data.text.split(input_data.delimiter)
+            if input_data.strip:
+                texts = [text.strip() for text in texts]
+            yield "texts", texts
+
+
+class TextReplaceBlock(Block):
+    class Input(BlockSchema):
+        text: str = SchemaField(description="The text to replace.")
+        old: str = SchemaField(description="The old text to replace.")
+        new: str = SchemaField(description="The new text to replace with.")
+
+    class Output(BlockSchema):
+        output: str = SchemaField(description="The text with the replaced text.")
+
+    def __init__(self):
+        super().__init__(
+            id="7e7c87ab-3469-4bcc-9abe-67705091b713",
+            description="This block is used to replace a text with a new text.",
+            categories={BlockCategory.TEXT},
+            input_schema=TextReplaceBlock.Input,
+            output_schema=TextReplaceBlock.Output,
+            test_input=[
+                {"text": "Hello, World!", "old": "Hello", "new": "Hi"},
+            ],
+            test_output=[
+                ("output", "Hi, World!"),
+            ],
+        )
+
+    async def run(self, input_data: Input, **kwargs) -> BlockOutput:
+        yield "output", input_data.text.replace(input_data.old, input_data.new)

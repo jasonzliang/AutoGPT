@@ -12,6 +12,7 @@ import "./customedge.css";
 import { X } from "lucide-react";
 import { useBezierPath } from "@/hooks/useBezierPath";
 import { FlowContext } from "./Flow";
+import { NodeExecutionResult } from "@/lib/autogpt-server-api";
 
 export type CustomEdgeData = {
   edgeColor: string;
@@ -19,7 +20,7 @@ export type CustomEdgeData = {
   isStatic?: boolean;
   beadUp?: number;
   beadDown?: number;
-  beadData?: any[];
+  beadData?: Map<string, NodeExecutionResult["status"]>;
 };
 
 type Bead = {
@@ -40,7 +41,6 @@ export function CustomEdge({
   targetY,
   markerEnd,
 }: EdgeProps<CustomEdge>) {
-  const [isHovered, setIsHovered] = useState(false);
   const [beads, setBeads] = useState<{
     beads: Bead[];
     created: number;
@@ -49,7 +49,7 @@ export function CustomEdge({
   const { svgPath, length, getPointForT, getTForDistance } = useBezierPath(
     sourceX - 5,
     sourceY - 5,
-    targetX - 9,
+    targetX + 3,
     targetY - 5,
   );
   const { deleteElements } = useReactFlow<Node, CustomEdge>();
@@ -93,7 +93,7 @@ export function CustomEdge({
       return;
     }
 
-    const beadUp = data?.beadUp!;
+    const beadUp: number = data?.beadUp ?? 0;
 
     // Add beads
     setBeads(({ beads, created, destroyed }) => {
@@ -114,10 +114,8 @@ export function CustomEdge({
         const newBeads = beads
           .map((bead) => ({ ...bead }))
           .filter((bead, index) => {
-            const beadDown = data?.beadDown!;
-
-            // Remove always one less bead in case of static edge, so it stays at the connection point
-            const removeCount = beadDown - destroyed - (data?.isStatic ? 1 : 0);
+            const beadDown: number = data?.beadDown ?? 0;
+            const removeCount = beadDown - destroyed;
             if (bead.t >= bead.targetT && index < removeCount) {
               destroyedCount++;
               return false;
@@ -153,10 +151,8 @@ export function CustomEdge({
             };
           })
           .filter((bead, index) => {
-            const beadDown = data?.beadDown!;
-
-            // Remove always one less bead in case of static edge, so it stays at the connection point
-            const removeCount = beadDown - destroyed - (data?.isStatic ? 1 : 0);
+            const beadDown: number = data?.beadDown ?? 0;
+            const removeCount = beadDown - destroyed;
             if (bead.t >= bead.targetT && index < removeCount) {
               destroyedCount++;
               return false;
@@ -182,13 +178,7 @@ export function CustomEdge({
       <BaseEdge
         path={svgPath}
         markerEnd={markerEnd}
-        style={{
-          strokeWidth: (isHovered ? 3 : 2) + (data?.isStatic ? 0.5 : 0),
-          stroke:
-            (data?.edgeColor ?? "#555555") +
-            (selected || isHovered ? "" : "80"),
-          strokeDasharray: data?.isStatic ? "5 3" : "0",
-        }}
+        className={`transition-all duration-200 ${data?.isStatic ? "[stroke-dasharray:5_3]" : "[stroke-dasharray:0]"} [stroke-width:${data?.isStatic ? 2.5 : 2}px] hover:[stroke-width:${data?.isStatic ? 3.5 : 3}px] ${selected ? `[stroke:${data?.edgeColor ?? "#555555"}]` : `[stroke:${data?.edgeColor ?? "#555555"}80] hover:[stroke:${data?.edgeColor ?? "#555555"}]`}`}
       />
       <path
         d={svgPath}
@@ -196,8 +186,6 @@ export function CustomEdge({
         strokeOpacity={0}
         strokeWidth={20}
         className="react-flow__edge-interaction"
-        onMouseEnter={() => setIsHovered(true)}
-        onMouseLeave={() => setIsHovered(false)}
       />
       <EdgeLabelRenderer>
         <div
@@ -209,9 +197,7 @@ export function CustomEdge({
           className="edge-label-renderer"
         >
           <button
-            onMouseEnter={() => setIsHovered(true)}
-            onMouseLeave={() => setIsHovered(false)}
-            className={`edge-label-button ${isHovered ? "visible" : ""}`}
+            className="edge-label-button opacity-0 transition-opacity duration-200 hover:opacity-100"
             onClick={onEdgeRemoveClick}
           >
             <X className="size-4" />

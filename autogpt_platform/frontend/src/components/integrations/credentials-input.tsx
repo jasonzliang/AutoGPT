@@ -1,3 +1,4 @@
+import { FC, useEffect, useMemo, useState } from "react";
 import { z } from "zod";
 import { cn } from "@/lib/utils";
 import { useForm } from "react-hook-form";
@@ -6,11 +7,18 @@ import { Button } from "@/components/ui/button";
 import SchemaTooltip from "@/components/SchemaTooltip";
 import useCredentials from "@/hooks/useCredentials";
 import { zodResolver } from "@hookform/resolvers/zod";
-import AutoGPTServerAPI from "@/lib/autogpt-server-api";
 import { NotionLogoIcon } from "@radix-ui/react-icons";
-import { FaDiscord, FaGithub, FaGoogle, FaMedium, FaKey } from "react-icons/fa";
-import { FC, useMemo, useState } from "react";
 import {
+  FaDiscord,
+  FaGithub,
+  FaTwitter,
+  FaGoogle,
+  FaMedium,
+  FaKey,
+  FaHubspot,
+} from "react-icons/fa";
+import {
+  BlockIOCredentialsSubSchema,
   CredentialsMetaInput,
   CredentialsProviderName,
 } from "@/lib/autogpt-server-api/types";
@@ -39,6 +47,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useBackendAPI } from "@/lib/autogpt-server-api/context";
 
 const fallbackIcon = FaKey;
 
@@ -47,27 +56,43 @@ export const providerIcons: Record<
   CredentialsProviderName,
   React.FC<{ className?: string }>
 > = {
+  aiml_api: fallbackIcon,
   anthropic: fallbackIcon,
+  apollo: fallbackIcon,
+  e2b: fallbackIcon,
   github: FaGithub,
   google: FaGoogle,
   groq: fallbackIcon,
   notion: NotionLogoIcon,
+  nvidia: fallbackIcon,
   discord: FaDiscord,
   d_id: fallbackIcon,
   google_maps: FaGoogle,
   jina: fallbackIcon,
   ideogram: fallbackIcon,
+  linear: fallbackIcon,
   medium: FaMedium,
+  mem0: fallbackIcon,
   ollama: fallbackIcon,
   openai: fallbackIcon,
   openweathermap: fallbackIcon,
   open_router: fallbackIcon,
+  llama_api: fallbackIcon,
   pinecone: fallbackIcon,
+  slant3d: fallbackIcon,
+  screenshotone: fallbackIcon,
+  smtp: fallbackIcon,
   replicate: fallbackIcon,
+  reddit: fallbackIcon,
   fal: fallbackIcon,
   revid: fallbackIcon,
+  twitter: FaTwitter,
   unreal_speech: fallbackIcon,
-  hubspot: fallbackIcon,
+  exa: fallbackIcon,
+  hubspot: FaHubspot,
+  smartlead: fallbackIcon,
+  todoist: fallbackIcon,
+  zerobounce: fallbackIcon,
 };
 // --8<-- [end:ProviderIconsEmbed]
 
@@ -84,31 +109,76 @@ export type OAuthPopupResultMessage = { message_type: "oauth_popup_result" } & (
 );
 
 export const CredentialsInput: FC<{
+  schema: BlockIOCredentialsSubSchema;
   className?: string;
   selectedCredentials?: CredentialsMetaInput;
   onSelectCredentials: (newValue?: CredentialsMetaInput) => void;
-}> = ({ className, selectedCredentials, onSelectCredentials }) => {
-  const api = useMemo(() => new AutoGPTServerAPI(), []);
-  const credentials = useCredentials();
+  siblingInputs?: Record<string, any>;
+  hideIfSingleCredentialAvailable?: boolean;
+}> = ({
+  schema,
+  className,
+  selectedCredentials,
+  onSelectCredentials,
+  siblingInputs,
+  hideIfSingleCredentialAvailable = true,
+}) => {
   const [isAPICredentialsModalOpen, setAPICredentialsModalOpen] =
     useState(false);
+  const [
+    isUserPasswordCredentialsModalOpen,
+    setUserPasswordCredentialsModalOpen,
+  ] = useState(false);
   const [isOAuth2FlowInProgress, setOAuth2FlowInProgress] = useState(false);
   const [oAuthPopupController, setOAuthPopupController] =
     useState<AbortController | null>(null);
   const [oAuthError, setOAuthError] = useState<string | null>(null);
 
-  if (!credentials || credentials.isLoading) {
+  const api = useBackendAPI();
+  const credentials = useCredentials(schema, siblingInputs);
+
+  // Deselect credentials if they do not exist (e.g. provider was changed)
+  useEffect(() => {
+    if (!credentials || !("savedCredentials" in credentials)) return;
+    if (
+      selectedCredentials &&
+      !credentials.savedCredentials.some((c) => c.id === selectedCredentials.id)
+    ) {
+      onSelectCredentials(undefined);
+    }
+  }, [credentials, selectedCredentials, onSelectCredentials]);
+
+  const singleCredential = useMemo(() => {
+    if (!credentials || !("savedCredentials" in credentials)) return null;
+
+    if (credentials.savedCredentials.length === 1)
+      return credentials.savedCredentials[0];
+
+    return null;
+  }, [credentials]);
+
+  // If only 1 credential is available, auto-select it and hide this input
+  useEffect(() => {
+    if (singleCredential && !selectedCredentials) {
+      onSelectCredentials(singleCredential);
+    }
+  }, [singleCredential, selectedCredentials, onSelectCredentials]);
+
+  if (
+    !credentials ||
+    credentials.isLoading ||
+    (singleCredential && hideIfSingleCredentialAvailable)
+  ) {
     return null;
   }
 
   const {
-    schema,
     provider,
     providerName,
     supportsApiKey,
     supportsOAuth2,
-    savedApiKeys,
-    savedOAuthCredentials,
+    supportsUserPassword,
+    savedCredentials,
     oAuthCallback,
   } = credentials;
 
@@ -206,12 +276,14 @@ export const CredentialsInput: FC<{
     <>
       {supportsApiKey && (
         <APIKeyCredentialsModal
+          schema={schema}
           open={isAPICredentialsModalOpen}
           onClose={() => setAPICredentialsModalOpen(false)}
           onCredentialsCreate={(credsMeta) => {
             onSelectCredentials(credsMeta);
             setAPICredentialsModalOpen(false);
           }}
+          siblingInputs={siblingInputs}
         />
       )}
       {supportsOAuth2 && (
@@ -221,27 +293,36 @@ export const CredentialsInput: FC<{
           providerName={providerName}
         />
       )}
+      {supportsUserPassword && (
+        <UserPasswordCredentialsModal
+          schema={schema}
+          open={isUserPasswordCredentialsModalOpen}
+          onClose={() => setUserPasswordCredentialsModalOpen(false)}
+          onCredentialsCreate={(creds) => {
+            onSelectCredentials(creds);
+            setUserPasswordCredentialsModalOpen(false);
+          }}
+          siblingInputs={siblingInputs}
+        />
+      )}
     </>
   );
 
-  // Deselect credentials if they do not exist (e.g. provider was changed)
-  if (
-    selectedCredentials &&
-    !savedApiKeys
-      .concat(savedOAuthCredentials)
-      .some((c) => c.id === selectedCredentials.id)
-  ) {
-    onSelectCredentials(undefined);
-  }
+  const fieldHeader = (
+    <div className="mb-2 flex gap-1">
+      <span className="text-m green text-gray-900">
+        {providerName} Credentials
+      </span>
+      <SchemaTooltip description={schema.description} />
+    </div>
+  );
 
   // No saved credentials yet
-  if (savedApiKeys.length === 0 && savedOAuthCredentials.length === 0) {
+  if (savedCredentials.length === 0) {
     return (
-      <>
-        <div className="mb-2 flex gap-1">
-          <span className="text-m green text-gray-900">Credentials</span>
-          <SchemaTooltip description={schema.description} />
-        </div>
+      <div>
+        {fieldHeader}
+
         <div className={cn("flex flex-row space-x-2", className)}>
           {supportsOAuth2 && (
             <Button onClick={handleOAuthLogin}>
@@ -255,32 +336,19 @@ export const CredentialsInput: FC<{
               Enter API key
             </Button>
           )}
+          {supportsUserPassword && (
+            <Button onClick={() => setUserPasswordCredentialsModalOpen(true)}>
+              <ProviderIcon className="mr-2 h-4 w-4" />
+              Enter username and password
+            </Button>
+          )}
         </div>
         {modals}
         {oAuthError && (
           <div className="mt-2 text-red-500">Error: {oAuthError}</div>
         )}
-      </>
+      </div>
     );
-  }
-
-  const singleCredential =
-    savedApiKeys.length === 1 && savedOAuthCredentials.length === 0
-      ? savedApiKeys[0]
-      : savedOAuthCredentials.length === 1 && savedApiKeys.length === 0
-        ? savedOAuthCredentials[0]
-        : null;
-
-  if (singleCredential) {
-    if (!selectedCredentials) {
-      onSelectCredentials({
-        id: singleCredential.id,
-        type: singleCredential.type,
-        provider,
-        title: singleCredential.title,
-      });
-    }
-    return null;
   }
 
   function handleValueChange(newValue: string) {
@@ -291,9 +359,7 @@ export const CredentialsInput: FC<{
       // Open API key dialog
       setAPICredentialsModalOpen(true);
     } else {
-      const selectedCreds = savedApiKeys
-        .concat(savedOAuthCredentials)
-        .find((c) => c.id == newValue)!;
+      const selectedCreds = savedCredentials.find((c) => c.id == newValue)!;
 
       onSelectCredentials({
         id: selectedCreds.id,
@@ -306,26 +372,40 @@ export const CredentialsInput: FC<{
 
   // Saved credentials exist
   return (
-    <>
-      <span className="text-m green mb-0 text-gray-900">Credentials</span>
+    <div>
+      {fieldHeader}
+
       <Select value={selectedCredentials?.id} onValueChange={handleValueChange}>
         <SelectTrigger>
           <SelectValue placeholder={schema.placeholder} />
         </SelectTrigger>
         <SelectContent className="nodrag">
-          {savedOAuthCredentials.map((credentials, index) => (
-            <SelectItem key={index} value={credentials.id}>
-              <ProviderIcon className="mr-2 inline h-4 w-4" />
-              {credentials.username}
-            </SelectItem>
-          ))}
-          {savedApiKeys.map((credentials, index) => (
-            <SelectItem key={index} value={credentials.id}>
-              <ProviderIcon className="mr-2 inline h-4 w-4" />
-              <IconKey className="mr-1.5 inline" />
-              {credentials.title}
-            </SelectItem>
-          ))}
+          {savedCredentials
+            .filter((c) => c.type == "oauth2")
+            .map((credentials, index) => (
+              <SelectItem key={index} value={credentials.id}>
+                <ProviderIcon className="mr-2 inline h-4 w-4" />
+                {credentials.username}
+              </SelectItem>
+            ))}
+          {savedCredentials
+            .filter((c) => c.type == "api_key")
+            .map((credentials, index) => (
+              <SelectItem key={index} value={credentials.id}>
+                <ProviderIcon className="mr-2 inline h-4 w-4" />
+                <IconKey className="mr-1.5 inline" />
+                {credentials.title}
+              </SelectItem>
+            ))}
+          {savedCredentials
+            .filter((c) => c.type == "user_password")
+            .map((credentials, index) => (
+              <SelectItem key={index} value={credentials.id}>
+                <ProviderIcon className="mr-2 inline h-4 w-4" />
+                <IconUserPlus className="mr-1.5 inline" />
+                {credentials.title}
+              </SelectItem>
+            ))}
           <SelectSeparator />
           {supportsOAuth2 && (
             <SelectItem value="sign-in">
@@ -339,22 +419,30 @@ export const CredentialsInput: FC<{
               Add new API key
             </SelectItem>
           )}
+          {supportsUserPassword && (
+            <SelectItem value="add-user-password">
+              <IconUserPlus className="mr-1.5 inline" />
+              Add new user password
+            </SelectItem>
+          )}
         </SelectContent>
       </Select>
       {modals}
       {oAuthError && (
         <div className="mt-2 text-red-500">Error: {oAuthError}</div>
       )}
-    </>
+    </div>
   );
 };
 
 export const APIKeyCredentialsModal: FC<{
+  schema: BlockIOCredentialsSubSchema;
   open: boolean;
   onClose: () => void;
   onCredentialsCreate: (creds: CredentialsMetaInput) => void;
-}> = ({ open, onClose, onCredentialsCreate }) => {
-  const credentials = useCredentials();
+  siblingInputs?: Record<string, any>;
+}> = ({ schema, open, onClose, onCredentialsCreate, siblingInputs }) => {
+  const credentials = useCredentials(schema, siblingInputs);
 
   const formSchema = z.object({
     apiKey: z.string().min(1, "API Key is required"),
@@ -375,8 +463,7 @@ export const APIKeyCredentialsModal: FC<{
     return null;
   }
 
-  const { schema, provider, providerName, createAPIKeyCredentials } =
-    credentials;
+  const { provider, providerName, createAPIKeyCredentials } = credentials;
 
   async function onSubmit(values: z.infer<typeof formSchema>) {
     const expiresAt = values.expiresAt
@@ -476,6 +563,130 @@ export const APIKeyCredentialsModal: FC<{
             />
             <Button type="submit" className="w-full">
               Save & use this API key
+            </Button>
+          </form>
+        </Form>
+      </DialogContent>
+    </Dialog>
+  );
+};
+
+export const UserPasswordCredentialsModal: FC<{
+  schema: BlockIOCredentialsSubSchema;
+  open: boolean;
+  onClose: () => void;
+  onCredentialsCreate: (creds: CredentialsMetaInput) => void;
+  siblingInputs?: Record<string, any>;
+}> = ({ schema, open, onClose, onCredentialsCreate, siblingInputs }) => {
+  const credentials = useCredentials(schema, siblingInputs);
+
+  const formSchema = z.object({
+    username: z.string().min(1, "Username is required"),
+    password: z.string().min(1, "Password is required"),
+    title: z.string().min(1, "Name is required"),
+  });
+
+  const form = useForm<z.infer<typeof formSchema>>({
+    resolver: zodResolver(formSchema),
+    defaultValues: {
+      username: "",
+      password: "",
+      title: "",
+    },
+  });
+
+  if (
+    !credentials ||
+    credentials.isLoading ||
+    !credentials.supportsUserPassword
+  ) {
+    return null;
+  }
+
+  const { provider, providerName, createUserPasswordCredentials } = credentials;
+
+  async function onSubmit(values: z.infer<typeof formSchema>) {
+    const newCredentials = await createUserPasswordCredentials({
+      username: values.username,
+      password: values.password,
+      title: values.title,
+    });
+    onCredentialsCreate({
+      provider,
+      id: newCredentials.id,
+      type: "user_password",
+      title: newCredentials.title,
+    });
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>
+            Add new username & password for {providerName}
+          </DialogTitle>
+        </DialogHeader>
+        <Form {...form}>
+          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+            <FormField
+              control={form.control}
+              name="username"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Username</FormLabel>
+                  <FormControl>
+                    <Input
+                      type="text"
+                      placeholder="Enter username..."
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="password"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Password</FormLabel>
+                  <FormControl>
+                    <Input
+                      type="password"
+                      placeholder="Enter password..."
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="title"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Name</FormLabel>
+                  <FormControl>
+                    <Input
+                      type="text"
+                      placeholder="Enter a name for this user login..."
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <Button type="submit" className="w-full">
+              Save & use this user login
             </Button>
           </form>
         </Form>

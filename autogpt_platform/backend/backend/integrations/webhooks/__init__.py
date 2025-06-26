@@ -1,17 +1,44 @@
+import functools
 from typing import TYPE_CHECKING
 
-from .github import GithubWebhooksManager
-
 if TYPE_CHECKING:
-    from .base import BaseWebhooksManager
+    from ..providers import ProviderName
+    from ._base import BaseWebhooksManager
 
-# --8<-- [start:WEBHOOK_MANAGERS_BY_NAME]
-WEBHOOK_MANAGERS_BY_NAME: dict[str, type["BaseWebhooksManager"]] = {
-    handler.PROVIDER_NAME: handler
-    for handler in [
-        GithubWebhooksManager,
-    ]
-}
-# --8<-- [end:WEBHOOK_MANAGERS_BY_NAME]
 
-__all__ = ["WEBHOOK_MANAGERS_BY_NAME"]
+# --8<-- [start:load_webhook_managers]
+@functools.cache
+def load_webhook_managers() -> dict["ProviderName", type["BaseWebhooksManager"]]:
+    webhook_managers = {}
+
+    from .compass import CompassWebhookManager
+    from .generic import GenericWebhooksManager
+    from .github import GithubWebhooksManager
+    from .slant3d import Slant3DWebhooksManager
+
+    webhook_managers.update(
+        {
+            handler.PROVIDER_NAME: handler
+            for handler in [
+                CompassWebhookManager,
+                GithubWebhooksManager,
+                Slant3DWebhooksManager,
+                GenericWebhooksManager,
+            ]
+        }
+    )
+    return webhook_managers
+
+
+# --8<-- [end:load_webhook_managers]
+
+
+def get_webhook_manager(provider_name: "ProviderName") -> "BaseWebhooksManager":
+    return load_webhook_managers()[provider_name]()
+
+
+def supports_webhooks(provider_name: "ProviderName") -> bool:
+    return provider_name in load_webhook_managers()
+
+
+__all__ = ["get_webhook_manager", "supports_webhooks"]

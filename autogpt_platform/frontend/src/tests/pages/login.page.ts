@@ -4,48 +4,67 @@ export class LoginPage {
   constructor(private page: Page) {}
 
   async login(email: string, password: string) {
-    console.log("Attempting login with:", { email, password }); // Debug log
+    console.log(`ℹ️ Attempting login on ${this.page.url()} with`, {
+      email,
+      password,
+    });
 
     // Fill email
-    const emailInput = this.page.getByPlaceholder("user@email.com");
+    const emailInput = this.page.getByPlaceholder("m@example.com");
     await emailInput.waitFor({ state: "visible" });
     await emailInput.fill(email);
 
     // Fill password
-    const passwordInput = this.page.getByPlaceholder("password");
+    const passwordInput = this.page.getByTitle("Password");
     await passwordInput.waitFor({ state: "visible" });
     await passwordInput.fill(password);
 
-    // Check terms
-    const termsCheckbox = this.page.getByLabel("I agree to the Terms of Use");
-    await termsCheckbox.waitFor({ state: "visible" });
-    await termsCheckbox.click();
-
     // TODO: This is a workaround to wait for the page to load after filling the email and password
-    const emailInput2 = this.page.getByPlaceholder("user@email.com");
+    const emailInput2 = this.page.getByPlaceholder("m@example.com");
     await emailInput2.waitFor({ state: "visible" });
     await emailInput2.fill(email);
 
     // Fill password
-    const passwordInput2 = this.page.getByPlaceholder("password");
+    const passwordInput2 = this.page.getByTitle("Password");
     await passwordInput2.waitFor({ state: "visible" });
     await passwordInput2.fill(password);
 
     // Wait for the button to be ready
-    const loginButton = this.page.getByRole("button", { name: "Log in" });
+    const loginButton = this.page.getByRole("button", {
+      name: "Login",
+      exact: true,
+    });
     await loginButton.waitFor({ state: "visible" });
 
-    // Start waiting for navigation before clicking
-    const navigationPromise = this.page.waitForURL("/", { timeout: 60000 });
+    // Attach navigation logger for debug purposes
+    this.page.on("load", (page) => console.log(`ℹ️ Now at URL: ${page.url()}`));
 
-    console.log("About to click login button"); // Debug log
+    // Start waiting for navigation before clicking
+    const leaveLoginPage = this.page
+      .waitForURL(
+        (url) => /^\/(marketplace|onboarding(\/.*)?)?$/.test(url.pathname),
+        { timeout: 10_000 },
+      )
+      .catch((reason) => {
+        console.error(
+          `🚨 Navigation away from /login timed out (current URL: ${this.page.url()}):`,
+          reason,
+        );
+        throw reason;
+      });
+
+    console.log(`🖱️ Clicking login button...`);
     await loginButton.click();
 
-    console.log("Waiting for navigation"); // Debug log
-    await navigationPromise;
+    console.log("⏳ Waiting for navigation away from /login ...");
+    await leaveLoginPage;
+    console.log(`⌛ Post-login redirected to ${this.page.url()}`);
 
-    console.log("Navigation complete, waiting for network idle"); // Debug log
-    await this.page.waitForLoadState("networkidle", { timeout: 60000 });
-    console.log("Login process complete"); // Debug log
+    await new Promise((resolve) => setTimeout(resolve, 200)); // allow time for client-side redirect
+    await this.page.waitForLoadState("load", { timeout: 10_000 });
+
+    console.log("➡️ Navigating to /marketplace ...");
+    await this.page.goto("/marketplace", { timeout: 10_000 });
+    console.log("✅ Login process complete");
   }
 }

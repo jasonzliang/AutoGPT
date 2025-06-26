@@ -2,14 +2,15 @@ import hashlib
 import hmac
 import logging
 
-import requests
 from fastapi import HTTPException, Request
 from strenum import StrEnum
 
 from backend.data import integrations
 from backend.data.model import Credentials
+from backend.integrations.providers import ProviderName
+from backend.util.request import Requests, Response
 
-from .base import BaseWebhooksManager
+from ._base import BaseWebhooksManager
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ class GithubWebhookType(StrEnum):
 
 
 class GithubWebhooksManager(BaseWebhooksManager):
-    PROVIDER_NAME = "github"
+    PROVIDER_NAME = ProviderName.GITHUB
 
     WebhookType = GithubWebhookType
 
@@ -58,18 +59,23 @@ class GithubWebhooksManager(BaseWebhooksManager):
 
         return payload, event_type
 
-    async def trigger_ping(self, webhook: integrations.Webhook) -> None:
+    async def trigger_ping(
+        self, webhook: integrations.Webhook, credentials: Credentials | None
+    ) -> None:
+        if not credentials:
+            raise ValueError("Credentials are required but were not passed")
+
         headers = {
             **self.GITHUB_API_DEFAULT_HEADERS,
-            "Authorization": f"Bearer {webhook.config.get('access_token')}",
+            "Authorization": credentials.auth_header(),
         }
 
         repo, github_hook_id = webhook.resource, webhook.provider_webhook_id
         ping_url = f"{self.GITHUB_API_URL}/repos/{repo}/hooks/{github_hook_id}/pings"
 
-        response = requests.post(ping_url, headers=headers)
+        response = await Requests().post(ping_url, headers=headers)
 
-        if response.status_code != 204:
+        if response.status != 204:
             error_msg = extract_github_error_msg(response)
             raise ValueError(f"Failed to ping GitHub webhook: {error_msg}")
 
@@ -90,7 +96,7 @@ class GithubWebhooksManager(BaseWebhooksManager):
 
         headers = {
             **self.GITHUB_API_DEFAULT_HEADERS,
-            "Authorization": credentials.bearer(),
+            "Authorization": credentials.auth_header(),
         }
         webhook_data = {
             "name": "web",
@@ -104,13 +110,13 @@ class GithubWebhooksManager(BaseWebhooksManager):
             },
         }
 
-        response = requests.post(
+        response = await Requests().post(
             f"{self.GITHUB_API_URL}/repos/{resource}/hooks",
             headers=headers,
             json=webhook_data,
         )
 
-        if response.status_code != 201:
+        if response.status != 201:
             error_msg = extract_github_error_msg(response)
             if "not found" in error_msg.lower():
                 error_msg = (
@@ -120,8 +126,9 @@ class GithubWebhooksManager(BaseWebhooksManager):
                 )
             raise ValueError(f"Failed to create GitHub webhook: {error_msg}")
 
-        webhook_id = response.json()["id"]
-        config = response.json()["config"]
+        resp = response.json()
+        webhook_id = resp["id"]
+        config = resp["config"]
 
         return str(webhook_id), config
 
@@ -136,7 +143,7 @@ class GithubWebhooksManager(BaseWebhooksManager):
 
         headers = {
             **self.GITHUB_API_DEFAULT_HEADERS,
-            "Authorization": credentials.bearer(),
+            "Authorization": credentials.auth_header(),
         }
 
         if webhook_type == self.WebhookType.REPO:
@@ -147,9 +154,9 @@ class GithubWebhooksManager(BaseWebhooksManager):
                 f"Unsupported webhook type '{webhook.webhook_type}'"
             )
 
-        response = requests.delete(delete_url, headers=headers)
+        response = await Requests().delete(delete_url, headers=headers)
 
-        if response.status_code not in [204, 404]:
+        if response.status not in [204, 404]:
             # 204 means successful deletion, 404 means the webhook was already deleted
             error_msg = extract_github_error_msg(response)
             raise ValueError(f"Failed to delete GitHub webhook: {error_msg}")
@@ -160,7 +167,7 @@ class GithubWebhooksManager(BaseWebhooksManager):
 # --8<-- [end:GithubWebhooksManager]
 
 
-def extract_github_error_msg(response: requests.Response) -> str:
+def extract_github_error_msg(response: Response) -> str:
     error_msgs = []
     resp = response.json()
     if resp.get("message"):

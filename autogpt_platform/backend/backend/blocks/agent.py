@@ -1,6 +1,8 @@
+import asyncio
 import logging
+from typing import Any, Optional
 
-from autogpt_libs.utils.cache import thread_cached
+from pydantic import JsonValue
 
 from backend.data.block import (
     Block,
@@ -13,23 +15,9 @@ from backend.data.block import (
 )
 from backend.data.execution import ExecutionStatus
 from backend.data.model import SchemaField
+from backend.util import json
 
 logger = logging.getLogger(__name__)
-
-
-@thread_cached
-def get_executor_manager_client():
-    from backend.executor import ExecutionManager
-    from backend.util.service import get_service_client
-
-    return get_service_client(ExecutionManager)
-
-
-@thread_cached
-def get_event_bus():
-    from backend.data.execution import RedisExecutionEventBus
-
-    return RedisExecutionEventBus()
 
 
 class AgentExecutorBlock(Block):
@@ -38,9 +26,30 @@ class AgentExecutorBlock(Block):
         graph_id: str = SchemaField(description="Graph ID")
         graph_version: int = SchemaField(description="Graph Version")
 
-        data: BlockInput = SchemaField(description="Input data for the graph")
+        inputs: BlockInput = SchemaField(description="Input data for the graph")
         input_schema: dict = SchemaField(description="Input schema for the graph")
         output_schema: dict = SchemaField(description="Output schema for the graph")
+
+        nodes_input_masks: Optional[dict[str, dict[str, JsonValue]]] = SchemaField(
+            default=None, hidden=True
+        )
+
+        @classmethod
+        def get_input_schema(cls, data: BlockInput) -> dict[str, Any]:
+            return data.get("input_schema", {})
+
+        @classmethod
+        def get_input_defaults(cls, data: BlockInput) -> BlockInput:
+            return data.get("inputs", {})
+
+        @classmethod
+        def get_missing_input(cls, data: BlockInput) -> set[str]:
+            required_fields = cls.get_input_schema(data).get("required", [])
+            return set(required_fields) - set(data)
+
+        @classmethod
+        def get_mismatch_error(cls, data: BlockInput) -> str | None:
+            return json.validate_with_jsonschema(cls.get_input_schema(data), data)
 
     class Output(BlockSchema):
         pass
@@ -55,32 +64,82 @@ class AgentExecutorBlock(Block):
             categories={BlockCategory.AGENT},
         )
 
-    def run(self, input_data: Input, **kwargs) -> BlockOutput:
-        executor_manager = get_executor_manager_client()
-        event_bus = get_event_bus()
+    async def run(self, input_data: Input, **kwargs) -> BlockOutput:
 
-        graph_exec = executor_manager.add_execution(
+        from backend.executor import utils as execution_utils
+
+        graph_exec = await execution_utils.add_graph_execution(
             graph_id=input_data.graph_id,
             graph_version=input_data.graph_version,
             user_id=input_data.user_id,
-            data=input_data.data,
+            inputs=input_data.inputs,
+            nodes_input_masks=input_data.nodes_input_masks,
+            use_db_query=False,
         )
-        log_id = f"Graph #{input_data.graph_id}-V{input_data.graph_version}, exec-id: {graph_exec.graph_exec_id}"
+
+        try:
+            async for name, data in self._run(
+                graph_id=input_data.graph_id,
+                graph_version=input_data.graph_version,
+                graph_exec_id=graph_exec.id,
+                user_id=input_data.user_id,
+            ):
+                yield name, data
+        except asyncio.CancelledError:
+            logger.warning(
+                f"Execution of graph {input_data.graph_id} version {input_data.graph_version} was cancelled."
+            )
+            await execution_utils.stop_graph_execution(
+                graph_exec.id, use_db_query=False
+            )
+        except Exception as e:
+            logger.error(
+                f"Execution of graph {input_data.graph_id} version {input_data.graph_version} failed: {e}, stopping execution."
+            )
+            await execution_utils.stop_graph_execution(
+                graph_exec.id, use_db_query=False
+            )
+            raise
+
+    async def _run(
+        self,
+        graph_id: str,
+        graph_version: int,
+        graph_exec_id: str,
+        user_id: str,
+    ) -> BlockOutput:
+
+        from backend.data.execution import ExecutionEventType
+        from backend.executor import utils as execution_utils
+
+        event_bus = execution_utils.get_async_execution_event_bus()
+
+        log_id = f"Graph #{graph_id}-V{graph_version}, exec-id: {graph_exec_id}"
         logger.info(f"Starting execution of {log_id}")
 
-        for event in event_bus.listen(
-            graph_id=graph_exec.graph_id, graph_exec_id=graph_exec.graph_exec_id
+        async for event in event_bus.listen(
+            user_id=user_id,
+            graph_id=graph_id,
+            graph_exec_id=graph_exec_id,
         ):
-            logger.info(
+            if event.status not in [
+                ExecutionStatus.COMPLETED,
+                ExecutionStatus.TERMINATED,
+                ExecutionStatus.FAILED,
+            ]:
+                logger.debug(
+                    f"Execution {log_id} received event {event.event_type} with status {event.status}"
+                )
+                continue
+
+            if event.event_type == ExecutionEventType.GRAPH_EXEC_UPDATE:
+                # If the graph execution is COMPLETED, TERMINATED, or FAILED,
+                # we can stop listening for further events.
+                break
+
+            logger.debug(
                 f"Execution {log_id} produced input {event.input_data} output {event.output_data}"
             )
-
-            if not event.node_id:
-                if event.status in [ExecutionStatus.COMPLETED, ExecutionStatus.FAILED]:
-                    logger.info(f"Execution {log_id} ended with status {event.status}")
-                    break
-                else:
-                    continue
 
             if not event.block_id:
                 logger.warning(f"{log_id} received event without block_id {event}")
@@ -96,5 +155,7 @@ class AgentExecutorBlock(Block):
                 continue
 
             for output_data in event.output_data.get("output", []):
-                logger.info(f"Execution {log_id} produced {output_name}: {output_data}")
+                logger.debug(
+                    f"Execution {log_id} produced {output_name}: {output_data}"
+                )
                 yield output_name, output_data

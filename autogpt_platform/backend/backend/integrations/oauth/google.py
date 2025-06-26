@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 from google.auth.external_account_authorized_user import (
     Credentials as ExternalAccountCredentials,
@@ -9,6 +10,7 @@ from google_auth_oauthlib.flow import Flow
 from pydantic import SecretStr
 
 from backend.data.model import OAuth2Credentials
+from backend.integrations.providers import ProviderName
 
 from .base import BaseOAuthHandler
 
@@ -21,7 +23,7 @@ class GoogleOAuthHandler(BaseOAuthHandler):
     Based on the documentation at https://developers.google.com/identity/protocols/oauth2/web-server
     """  # noqa
 
-    PROVIDER_NAME = "google"
+    PROVIDER_NAME = ProviderName.GOOGLE
     EMAIL_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
     DEFAULT_SCOPES = [
         "https://www.googleapis.com/auth/userinfo.email",
@@ -37,7 +39,9 @@ class GoogleOAuthHandler(BaseOAuthHandler):
         self.token_uri = "https://oauth2.googleapis.com/token"
         self.revoke_uri = "https://oauth2.googleapis.com/revoke"
 
-    def get_login_url(self, scopes: list[str], state: str) -> str:
+    def get_login_url(
+        self, scopes: list[str], state: str, code_challenge: Optional[str]
+    ) -> str:
         all_scopes = list(set(scopes + self.DEFAULT_SCOPES))
         logger.debug(f"Setting up OAuth flow with scopes: {all_scopes}")
         flow = self._setup_oauth_flow(all_scopes)
@@ -50,8 +54,8 @@ class GoogleOAuthHandler(BaseOAuthHandler):
         )
         return authorization_url
 
-    def exchange_code_for_tokens(
-        self, code: str, scopes: list[str]
+    async def exchange_code_for_tokens(
+        self, code: str, scopes: list[str], code_verifier: Optional[str]
     ) -> OAuth2Credentials:
         logger.debug(f"Exchanging code for tokens with scopes: {scopes}")
 
@@ -72,7 +76,7 @@ class GoogleOAuthHandler(BaseOAuthHandler):
         logger.debug(f"Scopes granted by Google: {granted_scopes}")
 
         google_creds = flow.credentials
-        logger.debug(f"Received credentials: {google_creds}")
+        logger.debug("Received credentials")
 
         logger.debug("Requesting user email")
         username = self._request_email(google_creds)
@@ -102,7 +106,7 @@ class GoogleOAuthHandler(BaseOAuthHandler):
 
         return credentials
 
-    def revoke_tokens(self, credentials: OAuth2Credentials) -> bool:
+    async def revoke_tokens(self, credentials: OAuth2Credentials) -> bool:
         session = AuthorizedSession(credentials)
         session.post(
             self.revoke_uri,
@@ -123,7 +127,9 @@ class GoogleOAuthHandler(BaseOAuthHandler):
             return None
         return response.json()["email"]
 
-    def _refresh_tokens(self, credentials: OAuth2Credentials) -> OAuth2Credentials:
+    async def _refresh_tokens(
+        self, credentials: OAuth2Credentials
+    ) -> OAuth2Credentials:
         # Google credentials should ALWAYS have a refresh token
         assert credentials.refresh_token
 

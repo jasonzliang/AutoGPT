@@ -2,8 +2,8 @@ import os
 from enum import Enum
 from typing import Literal
 
-import replicate
 from pydantic import SecretStr
+from replicate.client import Client as ReplicateClient
 from replicate.helpers import FileOutput
 
 from backend.data.block import Block, BlockCategory, BlockOutput, BlockSchema
@@ -13,6 +13,7 @@ from backend.data.model import (
     CredentialsMetaInput,
     SchemaField,
 )
+from backend.integrations.providers import ProviderName
 
 TEST_CREDENTIALS = APIKeyCredentials(
     id="01234567-89ab-cdef-0123-456789abcdef",
@@ -54,13 +55,11 @@ class ImageType(str, Enum):
 
 class ReplicateFluxAdvancedModelBlock(Block):
     class Input(BlockSchema):
-        credentials: CredentialsMetaInput[Literal["replicate"], Literal["api_key"]] = (
-            CredentialsField(
-                provider="replicate",
-                supported_credential_types={"api_key"},
-                description="The Replicate integration can be used with "
-                "any API key with sufficient permissions for the blocks it is used on.",
-            )
+        credentials: CredentialsMetaInput[
+            Literal[ProviderName.REPLICATE], Literal["api_key"]
+        ] = CredentialsField(
+            description="The Replicate integration can be used with "
+            "any API key with sufficient permissions for the blocks it is used on.",
         )
         prompt: str = SchemaField(
             description="Text prompt for image generation",
@@ -132,7 +131,7 @@ class ReplicateFluxAdvancedModelBlock(Block):
         super().__init__(
             id="90f8c45e-e983-4644-aa0b-b4ebe2f531bc",
             description="This block runs Flux models on Replicate with advanced settings.",
-            categories={BlockCategory.AI},
+            categories={BlockCategory.AI, BlockCategory.MULTIMEDIA},
             input_schema=ReplicateFluxAdvancedModelBlock.Input,
             output_schema=ReplicateFluxAdvancedModelBlock.Output,
             test_input={
@@ -160,7 +159,7 @@ class ReplicateFluxAdvancedModelBlock(Block):
             test_credentials=TEST_CREDENTIALS,
         )
 
-    def run(
+    async def run(
         self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
     ) -> BlockOutput:
         # If the seed is not provided, generate a random seed
@@ -169,7 +168,7 @@ class ReplicateFluxAdvancedModelBlock(Block):
             seed = int.from_bytes(os.urandom(4), "big")
 
         # Run the model using the provided inputs
-        result = self.run_model(
+        result = await self.run_model(
             api_key=credentials.api_key,
             model_name=input_data.replicate_model_name.api_name,
             prompt=input_data.prompt,
@@ -184,7 +183,7 @@ class ReplicateFluxAdvancedModelBlock(Block):
         )
         yield "result", result
 
-    def run_model(
+    async def run_model(
         self,
         api_key: SecretStr,
         model_name,
@@ -199,10 +198,10 @@ class ReplicateFluxAdvancedModelBlock(Block):
         safety_tolerance,
     ):
         # Initialize Replicate client with the API key
-        client = replicate.Client(api_token=api_key.get_secret_value())
+        client = ReplicateClient(api_token=api_key.get_secret_value())
 
         # Run the model with additional parameters
-        output: FileOutput | list[FileOutput] = client.run(  # type: ignore This is because they changed the return type, and didn't update the type hint! It should be overloaded depending on the value of `use_file_output` to `FileOutput | list[FileOutput]` but it's `Any | Iterator[Any]`
+        output: FileOutput | list[FileOutput] = await client.async_run(  # type: ignore This is because they changed the return type, and didn't update the type hint! It should be overloaded depending on the value of `use_file_output` to `FileOutput | list[FileOutput]` but it's `Any | Iterator[Any]`
             f"{model_name}",
             input={
                 "prompt": prompt,

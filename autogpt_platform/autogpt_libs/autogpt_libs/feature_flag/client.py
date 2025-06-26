@@ -13,7 +13,6 @@ from typing_extensions import ParamSpec
 from .config import SETTINGS
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG)
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -72,7 +71,7 @@ def feature_flag(
     """
 
     def decorator(
-        func: Callable[P, Union[T, Awaitable[T]]]
+        func: Callable[P, Union[T, Awaitable[T]]],
     ) -> Callable[P, Union[T, Awaitable[T]]]:
         @wraps(func)
         async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
